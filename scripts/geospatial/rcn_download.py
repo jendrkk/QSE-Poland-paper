@@ -20,7 +20,7 @@ a non-deterministic order (features get duplicated / skipped across pages).
 Deep STARTINDEX paging is also O(n^2) on MapServer. Both make naive pagination
 unusable for a full extract of 6.2M + 2.6M features.
 
-STRATEGY -- ADAPTIVE BBOX QUADTREE
+STRATEGY -- ADAPTIVE BBOX QUADTREE (GUGiK)
 ----------------------------------
 Every request is spatially bounded, which sidesteps ordering entirely:
 
