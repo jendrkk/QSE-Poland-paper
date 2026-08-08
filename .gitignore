@@ -4,10 +4,6 @@
 # Raw data
 data/raw/
 
-# Documentation
-docs/
-cursor_prompts/
-
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
