@@ -89,12 +89,26 @@ DOWNLOAD_COUNT = 100_000  # page size (server was verified to honour 100k)
 MIN_TILE_SIZE = 250.0    # metres; stop subdividing below this (safety floor)
 MAX_DEPTH = 18           # hard recursion cap (safety)
 WORKERS = 4              # concurrent HTTP requests (be polite to a gov server)
-HTTP_TIMEOUT = 900       # seconds per request (big tiles are ~250 MB)
+CONNECT_TIMEOUT = 30     # seconds to establish a connection
+READ_TIMEOUT = 120       # seconds to wait for the NEXT chunk of data
 RETRIES = 20
 BACKOFF = 1.5           # exponential backoff factor for retries
 BACKOFF_MAX = 60.0      # cap on a single backoff sleep (seconds)
 PAGE_SAFETY_CAP = 1000   # max pages per tile before we bail (should never hit)
 HEARTBEAT_SECS = 20      # time-based progress line even while big tiles download
+
+# Streaming stall-watchdog: abort a request whose throughput collapses (the
+# geoportal throttles heavy IPs to a near-zero trickle). Slow-but-alive tiles
+# are tolerated; only near-dead streams are aborted and retried.
+STREAM_CHUNK = 1 << 20   # 1 MiB read chunks
+STALL_WINDOW = 60        # seconds per throughput-measurement window
+STALL_MIN_BPS = 20_000   # < 20 KB/s sustained over a window => abort + retry
+PAGE_RETRIES = 5         # in-run retries per page on stall/connection drop
+PAGE_RETRY_PAUSE = 30    # seconds to wait before an in-run retry
+
+# Merge: flush accumulated features to the GeoPackage every ~this many rows
+# (bounds memory; far fewer SQLite transactions than one-write-per-tile).
+FLUSH_EVERY = 400_000
 
 # National extent of Poland in EPSG:2180 with a generous margin. The plan phase
 # refines this from the service capabilities, but this static box is a safe
@@ -147,8 +161,22 @@ class WFSError(RuntimeError):
     pass
 
 
+class StallError(WFSError):
+    """Raised when a response streams below the throughput floor (throttled)."""
+
+
+# Exceptions worth an in-run retry with a fresh connection.
+RETRYABLE = (
+    StallError,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.Timeout,
+)
+
+
 class RCNClient:
-    def __init__(self, base_url: str = BASE_URL, timeout: int = HTTP_TIMEOUT):
+    def __init__(self, base_url: str = BASE_URL,
+                 timeout: tuple[float, float] = (CONNECT_TIMEOUT, READ_TIMEOUT)):
         self.base_url = base_url
         self.timeout = timeout
         self.session = requests.Session()
@@ -173,13 +201,41 @@ class RCNClient:
     def _bbox_param(self, b: BBox) -> str:
         return "{:.3f},{:.3f},{:.3f},{:.3f},{}".format(b[0], b[1], b[2], b[3], SRS)
 
-    def _get(self, params: dict) -> bytes:
-        r = self.session.get(self.base_url, params=params, timeout=self.timeout)
-        r.raise_for_status()
-        raw = r.content
+    def _get(self, params: dict, stream: bool = False) -> bytes:
+        if not stream:
+            r = self.session.get(self.base_url, params=params,
+                                 timeout=self.timeout)
+            r.raise_for_status()
+            raw = r.content
+        else:
+            raw = self._get_streaming(params)
         if b"ExceptionReport" in raw[:4000] or b"ServiceException" in raw[:4000]:
             raise WFSError(raw[:600].decode("utf-8", "replace"))
         return raw
+
+    def _get_streaming(self, params: dict) -> bytes:
+        """GET with a throughput watchdog: raise StallError if the stream drops
+        below STALL_MIN_BPS over a STALL_WINDOW-second window."""
+        buf = bytearray()
+        win_start = time.time()
+        win_bytes = 0
+        with self.session.get(self.base_url, params=params,
+                              timeout=self.timeout, stream=True) as r:
+            r.raise_for_status()
+            for chunk in r.iter_content(STREAM_CHUNK):
+                if chunk:
+                    buf.extend(chunk)
+                    win_bytes += len(chunk)
+                elapsed = time.time() - win_start
+                if elapsed >= STALL_WINDOW:
+                    rate = win_bytes / elapsed
+                    if rate < STALL_MIN_BPS:
+                        raise StallError(
+                            f"throughput {rate:,.0f} B/s < {STALL_MIN_BPS:,} "
+                            f"over {int(elapsed)}s ({len(buf):,} B so far)")
+                    win_start = time.time()
+                    win_bytes = 0
+        return bytes(buf)
 
     def hits(self, layer: str, bbox: Optional[BBox] = None) -> int:
         params = {
@@ -202,7 +258,7 @@ class RCNClient:
             "BBOX": self._bbox_param(bbox),
             "COUNT": str(count), "STARTINDEX": str(startindex),
         }
-        raw = self._get(params)
+        raw = self._get(params, stream=True)
         if b"</wfs:FeatureCollection>" not in raw[-4000:]:
             raise WFSError("truncated FeatureCollection (no closing tag)")
         return raw
@@ -309,7 +365,18 @@ def fetch_leaf(client: RCNClient, layer: str, leaf: Leaf,
     start = 0
     k = 0
     while True:
-        raw = client.get_features(layer, leaf.bbox, count, start)
+        # In-run retry with a fresh connection on stall/connection drop, so a
+        # throttled tile self-heals instead of blocking a worker indefinitely.
+        for attempt in range(1, PAGE_RETRIES + 1):
+            try:
+                raw = client.get_features(layer, leaf.bbox, count, start)
+                break
+            except RETRYABLE as e:
+                if attempt == PAGE_RETRIES:
+                    raise
+                log(f"tile {tid} p{k} attempt {attempt}/{PAGE_RETRIES} "
+                    f"retrying after {PAGE_RETRY_PAUSE}s: {e!r}")
+                time.sleep(PAGE_RETRY_PAUSE)
         nret = _num_returned(raw)
         if nret <= 0:
             break
@@ -459,55 +526,96 @@ def _read_tile_gml(gz_path: Path):
     return gdf
 
 def merge_layer(layer: str, cache_dir: Path, out_dir: Path,
-                out_format: str) -> dict:
+                out_format: str, work_dir: Optional[Path] = None) -> dict:
+    import shutil
+    import tempfile
     import pyogrio
     import pandas as pd
+    import geopandas as gpd
 
     tdir = tiles_dir(cache_dir, layer)
     page_files = sorted(tdir.glob("*.p*.gml.gz"))
     if not page_files:
         raise SystemExit(f"merge[{layer}]: no tiles in {tdir}; run fetch first")
 
+    # Build the GeoPackage on LOCAL disk first. GPKG is SQLite, which needs
+    # POSIX fcntl locks that most network filesystems (NFS) do not provide ->
+    # "Failed to start transaction". We assemble locally, then move the
+    # finished single-file .gpkg to out_dir (which may live on NFS).
+    scratch = Path(tempfile.mkdtemp(prefix=f"rcn_merge_{layer}_",
+                                    dir=str(work_dir) if work_dir else None))
+    work_gpkg = scratch / f"{layer}.gpkg"
     out_gpkg = out_dir / f"{layer}.gpkg"
-    tmp_gpkg = out_dir / f"{layer}.tmp.gpkg"
-    if tmp_gpkg.exists():
-        tmp_gpkg.unlink()
+    log(f"merge[{layer}]: {len(page_files):,} tile files -> {out_gpkg}")
+    log(f"merge[{layer}]: assembling in local scratch {scratch}")
 
     seen: set[str] = set()
     ref_cols: Optional[list[str]] = None
     written = 0
+    buf: list = []
+    buf_n = 0
     t0 = time.time()
-    log(f"merge[{layer}]: {len(page_files):,} tile files -> {out_gpkg.name}")
-    for i, pf in enumerate(page_files, 1):
-        gdf = _read_tile_gml(pf)
-        if gdf is None:
-            continue
-        if "gml_id" not in gdf.columns:
-            raise WFSError(f"{pf.name}: no gml_id column exposed by GDAL")
-        gdf = gdf[~gdf["gml_id"].isin(seen)]
-        if len(gdf) == 0:
-            continue
-        seen.update(gdf["gml_id"].tolist())
-        if ref_cols is None:
-            ref_cols = list(gdf.columns)
-        else:
-            gdf = gdf.reindex(columns=ref_cols)
-        pyogrio.write_dataframe(
-            gdf, tmp_gpkg, layer=layer, driver="GPKG",
-            append=(written > 0),
-        )
-        written += len(gdf)
-        if i % 25 == 0 or i == len(page_files):
-            rate = written / max(time.time() - t0, 1e-9)
-            log(f"merge[{layer}]: {i:,}/{len(page_files):,} files "
-                f"| {written:,} unique features | {rate:,.0f} feat/s")
 
-    os.replace(tmp_gpkg, out_gpkg)
+    def flush() -> None:
+        nonlocal buf, buf_n, written
+        if not buf:
+            return
+        gdf = pd.concat(buf, ignore_index=True) if len(buf) > 1 else buf[0]
+        gdf = gpd.GeoDataFrame(gdf, geometry="geometry", crs=f"EPSG:{EPSG}")
+        pyogrio.write_dataframe(gdf, work_gpkg, layer=layer, driver="GPKG",
+                                append=(written > 0))
+        written += len(gdf)
+        buf = []
+        buf_n = 0
+        rate = written / max(time.time() - t0, 1e-9)
+        log(f"merge[{layer}]: flushed -> {written:,} unique features "
+            f"| {rate:,.0f} feat/s")
+
+    try:
+        for i, pf in enumerate(page_files, 1):
+            gdf = _read_tile_gml(pf)
+            if gdf is None:
+                continue
+            if "gml_id" not in gdf.columns:
+                raise WFSError(f"{pf.name}: no gml_id column exposed by GDAL")
+            gdf = gdf[~gdf["gml_id"].isin(seen)]
+            if len(gdf) == 0:
+                continue
+            seen.update(gdf["gml_id"].tolist())
+            if ref_cols is None:
+                ref_cols = list(gdf.columns)
+            elif list(gdf.columns) != ref_cols:
+                gdf = gdf.reindex(columns=ref_cols)
+            buf.append(gdf)
+            buf_n += len(gdf)
+            if buf_n >= FLUSH_EVERY:
+                flush()
+            if i % 25 == 0 or i == len(page_files):
+                log(f"merge[{layer}]: read {i:,}/{len(page_files):,} tiles "
+                    f"| {len(seen):,} unique so far | buffer {buf_n:,}")
+        flush()
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if out_gpkg.exists():
+            out_gpkg.unlink()
+        shutil.move(str(work_gpkg), str(out_gpkg))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+    # Verify the on-disk feature count matches the de-duplicated total.
+    info = pyogrio.read_info(str(out_gpkg))
+    n_out = int(info["features"])
+    ok = (n_out == written == len(seen))
     stats = {"layer": layer, "unique_features": written,
-             "tile_files": len(page_files), "output": str(out_gpkg)}
+             "gpkg_features": n_out, "tile_files": len(page_files),
+             "verified": bool(ok), "output": str(out_gpkg)}
+    if not ok:
+        log(f"merge[{layer}]: WARN count mismatch written={written:,} "
+            f"gpkg={n_out:,} seen={len(seen):,}")
     if out_format in ("parquet", "both"):
         _write_parquet(out_gpkg, out_dir / f"{layer}.parquet", stats)
-    log(f"merge[{layer}]: DONE -> {out_gpkg} ({written:,} unique features)")
+    log(f"merge[{layer}]: DONE -> {out_gpkg} "
+        f"({written:,} unique features, verified={ok})")
     return stats
 
 
@@ -534,7 +642,8 @@ def run_layer(client: RCNClient, layer: str, cache_dir: Path, out_dir: Path,
     if args.phase in ("fetch", "all"):
         fetch_layer(client, layer, leaves, cache_dir, args.count, args.workers)
     if args.phase in ("merge", "all"):
-        return merge_layer(layer, cache_dir, out_dir, args.out_format)
+        return merge_layer(layer, cache_dir, out_dir, args.out_format,
+                           work_dir=args.work_dir)
     return None
 
 
@@ -545,6 +654,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                    help="Layers to process (default: budynki lokale).")
     p.add_argument("--out", type=Path, default=DEFAULT_OUT,
                    help="Output directory (default: data/raw/floorspace).")
+    p.add_argument("--work-dir", type=Path, default=None, dest="work_dir",
+                   help="LOCAL scratch dir for building GeoPackages before "
+                        "moving them to --out. Set this to fast local disk if "
+                        "--out is on a network filesystem (NFS). Default: "
+                        "system temp.")
     p.add_argument("--phase", choices=["plan", "fetch", "merge", "all"],
                    default="all", help="Which phase to run (default: all).")
     p.add_argument("--workers", type=int, default=WORKERS,

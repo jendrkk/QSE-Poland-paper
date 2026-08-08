@@ -63,3 +63,25 @@ data/raw/floorspace/
   `--workers` cautiously; it is a public government server.
 - **Validated:** on a 20 km test box the merged unique count equals the exact
   `hits` count (2,984), confirming completeness and correct border de-dup.
+
+## Network filesystems (NFS) — important
+GeoPackage is SQLite and needs POSIX file locks that most NFS mounts do not
+provide; writing a `.gpkg` directly onto an NFS path fails with
+`DataSourceError: Failed to start transaction`. The merge therefore assembles
+each GeoPackage in **local scratch** and moves the finished file to `--out`.
+Scratch defaults to the system temp dir; if that is small or also networked,
+point it at local disk with space:
+
+```bash
+python scripts/geospatial/rcn_download.py --phase merge --work-dir /path/to/local/scratch
+```
+Check first with `df -h /tmp` (or your chosen `--work-dir`) — a full-layer
+GeoPackage is several GB.
+
+## Throttling / stalls
+The geoportal throttles heavy IPs to a near-zero trickle, which can freeze a
+worker. The fetcher streams each response with a **throughput watchdog**: if a
+tile drops below `STALL_MIN_BPS` (20 KB/s) over a 60 s window it is aborted and
+retried on a fresh connection (`PAGE_RETRIES` times, then left for the next
+run). Slow-but-alive tiles are tolerated. If throttling is persistent, drop to
+`--workers 2` (or `1`); it is usually faster overall than fighting the throttle.
