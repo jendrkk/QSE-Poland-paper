@@ -90,9 +90,11 @@ MIN_TILE_SIZE = 250.0    # metres; stop subdividing below this (safety floor)
 MAX_DEPTH = 18           # hard recursion cap (safety)
 WORKERS = 4              # concurrent HTTP requests (be polite to a gov server)
 HTTP_TIMEOUT = 900       # seconds per request (big tiles are ~250 MB)
-RETRIES = 5
-BACKOFF = 2.0            # exponential backoff factor for retries
+RETRIES = 8
+BACKOFF = 1.5           # exponential backoff factor for retries
+BACKOFF_MAX = 60.0      # cap on a single backoff sleep (seconds)
 PAGE_SAFETY_CAP = 1000   # max pages per tile before we bail (should never hit)
+HEARTBEAT_SECS = 15      # time-based progress line even while big tiles download
 
 # National extent of Poland in EPSG:2180 with a generous margin. The plan phase
 # refines this from the service capabilities, but this static box is a safe
@@ -157,6 +159,11 @@ class RCNClient:
             allowed_methods=frozenset(["GET"]),
             raise_on_status=False,
         )
+        # Cap per-attempt backoff (attr name differs across urllib3 versions).
+        try:
+            retry.backoff_max = BACKOFF_MAX
+        except Exception:
+            pass
         ad = HTTPAdapter(max_retries=retry, pool_connections=WORKERS * 2,
                          pool_maxsize=WORKERS * 2)
         self.session.mount("https://", ad)
@@ -328,28 +335,92 @@ def fetch_layer(client: RCNClient, layer: str, leaves: list[Leaf],
     tdir = tiles_dir(cache_dir, layer)
     todo = [lf for lf in leaves
             if not (tdir / f"{tile_id(lf.bbox)}.done.json").exists()]
-    log(f"fetch[{layer}]: {len(leaves):,} tiles total, "
-        f"{len(todo):,} still to download")
-    done_ct = len(leaves) - len(todo)
+    total = len(leaves)
+    log(f"fetch[{layer}]: {total:,} tiles total, {len(todo):,} still to download")
+    if not todo:
+        log(f"fetch[{layer}]: nothing to do (all tiles already cached)")
+        return
+
+    done_ct = total - len(todo)
     feat_ct = 0
+    failed: list[tuple[Leaf, str]] = []
+    inflight: set[str] = set()
     lock = threading.Lock()
     t0 = time.time()
-    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(fetch_leaf, client, layer, lf, tdir, count): lf
-                for lf in todo}
-        for fut in cf.as_completed(futs):
-            lf = futs[fut]
-            status, n = fut.result()
+
+    # Background heartbeat: prints a status line every HEARTBEAT_SECS even when
+    # no tile has completed (large tiles can take 1-2 min each).
+    stop = threading.Event()
+
+    def heartbeat() -> None:
+        while not stop.wait(HEARTBEAT_SECS):
             with lock:
-                done_ct += 1
-                feat_ct += n
-                if done_ct % 10 == 0 or status == "ok":
-                    rate = feat_ct / max(time.time() - t0, 1e-9)
-                    log(f"fetch[{layer}]: {done_ct:,}/{len(leaves):,} tiles "
-                        f"| +{n:,} feat (tile {tile_id(lf.bbox)}) "
-                        f"| {feat_ct:,} new feat | {rate:,.0f} feat/s")
+                dc, fc, inf = done_ct, feat_ct, sorted(inflight)
+            rate = fc / max(time.time() - t0, 1e-9)
+            log(f"fetch[{layer}] ~ {dc:,}/{total:,} tiles done | "
+                f"{len(inf)} downloading now {inf[:4]}"
+                f"{'...' if len(inf) > 4 else ''} | {fc:,} new feat | "
+                f"{rate:,.0f} feat/s | elapsed {int(time.time()-t0)}s")
+
+    def run(lf: Leaf) -> tuple[str, int]:
+        tid = tile_id(lf.bbox)
+        with lock:
+            inflight.add(tid)
+        try:
+            return fetch_leaf(client, layer, lf, tdir, count)
+        finally:
+            with lock:
+                inflight.discard(tid)
+
+    hb = threading.Thread(target=heartbeat, daemon=True)
+    hb.start()
+    try:
+        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(run, lf): lf for lf in todo}
+            for fut in cf.as_completed(futs):
+                lf = futs[fut]
+                tid = tile_id(lf.bbox)
+                try:
+                    status, n = fut.result()
+                except Exception as e:  # keep going; tile retried on re-run
+                    with lock:
+                        failed.append((lf, repr(e)))
+                    log(f"fetch[{layer}]: WARN tile {tid} failed: {e!r} "
+                        f"(left for retry)")
+                    continue
+                with lock:
+                    done_ct += 1
+                    feat_ct += n
+                    dc, fc = done_ct, feat_ct
+                rate = fc / max(time.time() - t0, 1e-9)
+                log(f"fetch[{layer}]: {dc:,}/{total:,} tiles | +{n:,} feat "
+                    f"(tile {tid}) | {fc:,} new feat | {rate:,.0f} feat/s")
+    finally:
+        stop.set()
+        hb.join(timeout=2)
+
+    # One sequential retry pass for tiles that dropped (eases server pressure).
+    if failed:
+        log(f"fetch[{layer}]: retrying {len(failed)} failed tiles sequentially...")
+        still: list[str] = []
+        for lf, _ in failed:
+            tid = tile_id(lf.bbox)
+            try:
+                _, n = fetch_leaf(client, layer, lf, tdir, count)
+                with lock:
+                    done_ct += 1
+                    feat_ct += n
+                log(f"fetch[{layer}]: retry OK {tid} (+{n:,} feat)")
+            except Exception as e:
+                still.append(tid)
+                log(f"fetch[{layer}]: retry FAILED {tid}: {e!r}")
+        if still:
+            log(f"fetch[{layer}]: {len(still)} tiles still failing; just re-run "
+                f"the script to pick them up: {still[:8]}"
+                f"{'...' if len(still) > 8 else ''}")
+
     log(f"fetch[{layer}]: complete, {feat_ct:,} features fetched this run "
-        f"in {time.time()-t0:.0f}s")
+        f"in {time.time()-t0:.0f}s ({done_ct:,}/{total:,} tiles cached)")
 
 # ----------------------------------------------------------------------------
 # Phase 3 -- MERGE (stream tiles -> one GeoPackage per layer, de-dup by gml:id)
