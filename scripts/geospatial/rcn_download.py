@@ -89,12 +89,12 @@ DOWNLOAD_COUNT = 100_000  # page size (server was verified to honour 100k)
 MIN_TILE_SIZE = 250.0    # metres; stop subdividing below this (safety floor)
 MAX_DEPTH = 18           # hard recursion cap (safety)
 WORKERS = 4              # concurrent HTTP requests (be polite to a gov server)
-HTTP_TIMEOUT = 900       # seconds per request (big tiles are ~250 MB)
-RETRIES = 8
+HTTP_TIMEOUT = 6000       # seconds per request (big tiles are ~250 MB)
+RETRIES = 20
 BACKOFF = 1.5           # exponential backoff factor for retries
 BACKOFF_MAX = 60.0      # cap on a single backoff sleep (seconds)
 PAGE_SAFETY_CAP = 1000   # max pages per tile before we bail (should never hit)
-HEARTBEAT_SECS = 15      # time-based progress line even while big tiles download
+HEARTBEAT_SECS = 20      # time-based progress line even while big tiles download
 
 # National extent of Poland in EPSG:2180 with a generous margin. The plan phase
 # refines this from the service capabilities, but this static box is a safe
