@@ -88,7 +88,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RASTER = REPO_ROOT / "data" / "raw" / "pop" / \
     "JRC-ESTAT_Census_Population_2021_100m_rev0726.tif"
 DEFAULT_BBOX = REPO_ROOT / "data" / "raw" / "shapefiles" / "poland_bbox.geojson"
-DEFAULT_OUTPUT = REPO_ROOT / "data" / "processed" / "pop" / \
+DEFAULT_OUTPUT = REPO_ROOT / "data" / "raw" / "pop" / \
     "poland_bbox_pop_100m.parquet"
 
 LOGGER = logging.getLogger("extract_population_grid")
