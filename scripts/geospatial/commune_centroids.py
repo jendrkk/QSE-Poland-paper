@@ -336,7 +336,8 @@ def main(argv=None) -> int:
     pop_grid_gdf = pop_grid_gdf.to_crs("EPSG:3035")
 
     LOGGER.info("Loading communes: %s", args.communes)
-    communes = gpd.read_file(args.communes)
+    # PRG .shp/.dbf is UTF-8; without encoding=, pyogrio/fiona often Latin-1-mojibakes names.
+    communes = gpd.read_file(args.communes, encoding="utf-8")
     LOGGER.info("  features=%d  CRS=%s", len(communes), communes.crs)
     communes = communes.to_crs("EPSG:3035")
     communes_border = communes.geometry.union_all()
