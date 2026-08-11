@@ -82,28 +82,6 @@ USAGE
   # also enrich flats with building context (keeps lok_pow_uzyt):
   python rcn_bdot10k_extend.py --lokale data/raw/floorspace/lokale.gpkg
 
-  # ALSO build budynki_dzialki_bdot10k.gpkg: every BDOT building sitting on a
-  # built-up RCN parcel, with BDOT attributes/areas + the parcel's identifiers:
-  python rcn_bdot10k_extend.py --calibrate --workers 40 \
-      --scratch-dir /local/scratch \
-      --dzialki data/raw/floorspace/dzialki.gpkg
-
-DZIALKI MODE (budynki_dzialki_bdot10k.gpkg)
---------------------------------------------------------------------------------
-Built-up RCN parcels (nier_rodzaj in nieruchomoscGruntowaZabudowana /
-nieruchomoscLokalowa) are de-duplicated by dzi_id_dzialki, aggregating the SET of
-transaction identifiers (gml_id, tran_lokalny_id_iip) that touched each parcel.
-Every BDOT10k building whose footprint lies >= --parcel-min-frac (default 0.50)
-inside a parcel is collected as one output row (building footprint geometry) with:
-  bdot_building_id, bdot_floors, bdot_function_general/detailed,
-  footprint_m2, gross_area_m2 (= footprint * floors),
-  usable_area_est_m2 (= gross * k, same k as budynki),
-  overlap_frac, n_transactions,
-  dzi_id_dzialki, dzi_teryt        (single-valued, the assigned parcel)
-  dzi_gml_ids, dzi_tran_lokalny_id_iip  (';'-joined SETS over the parcel's txns)
-A building straddling two parcels is assigned to the one it overlaps most; a
-building on no built-up parcel is not emitted. Reuses the BDOT download cache.
-
 Dependencies: geopandas, pyogrio, shapely, pandas, numpy, requests
               + bdot10k_query.py on the path (same scripts/geospatial folder).
 ================================================================================
@@ -130,13 +108,6 @@ DEFAULT_MIN_OVERLAP_FRAC = 0.10
 DEFAULT_SNAP_M = 25.0
 DEFAULT_USABLE_FACTOR = 0.80
 RESIDENTIAL_SUBSTR = "mieszk"
-
-# Which RCN parcels count as "built-up" for the dzialki -> BDOT collection.
-# (nieruchomoscGruntowaNiezabudowana = empty land, excluded; nieruchomoscBudynkowa
-# is a building-condominium and is left out by default -- add it here if wanted.)
-BUILDUP_KINDS = ("nieruchomoscGruntowaZabudowana", "nieruchomoscLokalowa")
-# A BDOT building is assigned to the built-up parcel it mostly sits on:
-DEFAULT_PARCEL_MIN_FRAC = 0.50   # >= 50% of the building footprint inside the parcel
 
 # Reuse the (already validated) BDOT downloader/loader from the query script.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -358,121 +329,6 @@ def _match_points(pts, bdot, snap_m):
 
 
 # ==============================================================================
-# Per-powiat worker: collect BDOT buildings that sit on built-up RCN parcels
-# ==============================================================================
-def _worker_dzialki(task: dict) -> dict:
-    """
-    For one powiat: take built-up RCN parcels (dzialki), and collect every BDOT10k
-    building whose footprint lies mostly (>= min_frac) inside one of those parcels.
-    Output is one row PER BDOT BUILDING (footprint geometry) carrying the BDOT
-    attributes + areas + the parcel identifiers it was assigned to.
-    """
-    import geopandas as gpd
-    import pyogrio
-
-    powiat = task["powiat"]
-    src = task["src"]
-    layer = task["layer"]
-    teryt_col = task["teryt_col"]
-    cache_dir = Path(task["cache_dir"])
-    shard_dir = Path(task["shard_dir"])
-    out_layer = task["out_layer"]
-    min_frac = task["min_frac"]
-    kinds = task["kinds"]
-
-    res = {"powiat": powiat, "n": 0, "matched": 0, "shard": None,
-           "ratios": np.empty(0), "error": None}
-    try:
-        kinds_sql = "(" + ",".join("'%s'" % k for k in kinds) + ")"
-        where = f"{teryt_col}='{powiat}' AND nier_rodzaj IN {kinds_sql}"
-        par = pyogrio.read_dataframe(src, layer=layer, where=where)
-        if len(par) == 0:
-            return res
-        if par.crs is None:
-            par = par.set_crs(EPSG_PL)
-        elif par.crs.to_epsg() != EPSG_PL:
-            par = par.to_crs(EPSG_PL)
-        par = par[par.geometry.notna()].copy()
-        if not par.geometry.is_valid.all():
-            par["geometry"] = par.geometry.buffer(0)
-
-        # collapse the (parcel x transaction) rows to one row per parcel, keeping
-        # the SET of transaction identifiers that touched that parcel.
-        def _uniqjoin(s):
-            vals = [str(x) for x in s if x is not None and str(x) != "nan" and str(x) != ""]
-            return ";".join(sorted(set(vals)))
-
-        agg = par.groupby("dzi_id_dzialki").agg(
-            dzi_teryt=(teryt_col, "first"),
-            dzi_gml_ids=("gml_id", _uniqjoin),
-            dzi_tran_lokalny_id_iip=("tran_lokalny_id_iip", _uniqjoin),
-            n_transactions=("gml_id", "size"))
-        geom = par.drop_duplicates("dzi_id_dzialki").set_index("dzi_id_dzialki").geometry
-        parcels = gpd.GeoDataFrame(agg.join(geom), geometry="geometry",
-                                   crs=EPSG_PL).reset_index()
-        res["n"] = len(parcels)   # number of distinct built-up parcels
-
-        try:
-            bdot = load_bdot_powiat(powiat, cache_dir)
-        except Exception as e:
-            res["error"] = f"bdot_load: {e}"
-            return res
-        if bdot is None or len(bdot) == 0:
-            return res
-        bdot = bdot.reset_index(drop=True).copy()
-        if not bdot.geometry.is_valid.all():
-            bdot["geometry"] = bdot.geometry.buffer(0)
-        bdot["_bid"] = np.arange(len(bdot))
-        bdot["footprint_m2"] = bdot.geometry.area
-        parcels["_pid"] = np.arange(len(parcels))
-
-        # assign each building to the parcel it overlaps most (>= min_frac of bldg)
-        pairs = gpd.sjoin(bdot[["_bid", "geometry"]], parcels[["_pid", "geometry"]],
-                          predicate="intersects", how="inner")
-        if len(pairs) == 0:
-            return res
-        bi = pairs["_bid"].to_numpy()
-        pi = pairs["_pid"].to_numpy()
-        lg = gpd.GeoSeries(bdot.geometry.to_numpy()[bi], crs=EPSG_PL)
-        rg = gpd.GeoSeries(parcels.geometry.to_numpy()[pi], crs=EPSG_PL)
-        inter = lg.intersection(rg, align=False).area.to_numpy()
-        cand = pd.DataFrame({"_bid": bi, "_pid": pi, "_inter": inter})
-        cand = cand.sort_values("_inter").drop_duplicates("_bid", keep="last")
-        frac = cand["_inter"].to_numpy() / bdot["footprint_m2"].to_numpy()[cand["_bid"].to_numpy()]
-        cand = cand.assign(overlap_frac=frac)
-        cand = cand[cand["overlap_frac"] >= min_frac]
-        if len(cand) == 0:
-            return res
-
-        b = bdot.iloc[cand["_bid"].to_numpy()].reset_index(drop=True)
-        p = parcels.iloc[cand["_pid"].to_numpy()].reset_index(drop=True)
-        out = gpd.GeoDataFrame({
-            "bdot_building_id": b.get("building_id"),
-            "bdot_floors": pd.to_numeric(b.get("floors_above"), errors="coerce"),
-            "bdot_function_general": b.get("function_general"),
-            "bdot_function_detailed": b.get("function_detailed"),
-            "footprint_m2": b["footprint_m2"].to_numpy(),
-            "gross_area_m2": b["footprint_m2"].to_numpy() * pd.to_numeric(
-                b.get("floors_above"), errors="coerce").to_numpy(),
-            "overlap_frac": cand["overlap_frac"].to_numpy(),
-            "dzi_id_dzialki": p["dzi_id_dzialki"].to_numpy(),
-            "dzi_teryt": p["dzi_teryt"].to_numpy(),
-            "dzi_gml_ids": p["dzi_gml_ids"].to_numpy(),
-            "dzi_tran_lokalny_id_iip": p["dzi_tran_lokalny_id_iip"].to_numpy(),
-            "n_transactions": p["n_transactions"].to_numpy(),
-            "geometry": b.geometry.to_numpy(),
-        }, geometry="geometry", crs=EPSG_PL)
-        res["matched"] = len(out)   # number of buildings collected
-
-        shard = shard_dir / f"{powiat}.gpkg"
-        pyogrio.write_dataframe(out, shard, layer=out_layer)
-        res["shard"] = str(shard)
-    except Exception as e:
-        res["error"] = f"{e}\n{traceback.format_exc()}"
-    return res
-
-
-# ==============================================================================
 # Orchestration
 # ==============================================================================
 def list_powiats(src: str, layer: str, teryt_col: str, only=None):
@@ -498,45 +354,9 @@ def calibrate_k(ratio_arrays, fallback, min_n=100):
     return float(fallback), len(allr), False
 
 
-def calibrate_k_by_voiv(results, fallback, min_n=100):
+def assemble(shards, out_path, layer, k, scratch_dir):
     """
-    Per-voivodeship correction factor (voiv id = first 2 chars of the powiat TERYT).
-    Returns (k_dict{voiv->k}, k_global, table) where table is a list of
-    (voiv, k, n_rows, source) rows. Voivodeships with < min_n calibration samples
-    fall back to the national median (or the fixed fallback if that is thin too).
-    """
-    from collections import defaultdict
-    byv = defaultdict(list)
-    allr = []
-    for r in results:
-        p = r.get("powiat")
-        ratios = r.get("ratios", np.empty(0))
-        if p is None or len(ratios) == 0:
-            continue
-        byv[str(p)[:2]].append(ratios)
-        allr.append(ratios)
-    allr = np.concatenate(allr) if allr else np.empty(0)
-    k_global = float(np.median(allr)) if len(allr) >= min_n else float(fallback)
-
-    k_dict, table = {}, []
-    for v in sorted(byv):
-        arr = np.concatenate(byv[v])
-        if len(arr) >= min_n:
-            kv, src = float(np.median(arr)), "calibrated"
-        else:
-            kv, src = k_global, "global-fallback"
-        k_dict[v] = kv
-        table.append((v, kv, len(arr), src))
-    return k_dict, k_global, table
-
-
-def assemble(shards, out_path, layer, k, scratch_dir, teryt_col=None, k_default=None):
-    """
-    Merge shards into the final GPKG, adding usable_area_est_m2 = gross * k.
-
-    `k` may be a scalar OR a dict {voiv_id -> k}. When it is a dict, the row's
-    voivodeship (first 2 chars of `teryt_col`) selects the factor, with `k_default`
-    for any voiv missing from the map.
+    Merge GeoParquet shards into the final GPKG, adding usable_area_est_m2 = gross*k.
 
     The GPKG is BUILT ON LOCAL DISK (scratch_dir) because SQLite (the GPKG backend)
     cannot hold locks over NFS. The finished, closed file is then copied to the
@@ -558,14 +378,7 @@ def assemble(shards, out_path, layer, k, scratch_dir, teryt_col=None, k_default=
             continue
         gdf = pyogrio.read_dataframe(shard)
         if "gross_area_m2" in gdf.columns:
-            if isinstance(k, dict):
-                voiv = gdf[teryt_col].astype(str).str[:2]
-                kser = voiv.map(k)
-                if k_default is not None:
-                    kser = kser.fillna(k_default)
-                gdf["usable_area_est_m2"] = gdf["gross_area_m2"] * kser
-            else:
-                gdf["usable_area_est_m2"] = gdf["gross_area_m2"] * k
+            gdf["usable_area_est_m2"] = gdf["gross_area_m2"] * k
         # residential flag from BDOT function or RCN kind
         fg = gdf.get("bdot_function_general")
         fd = gdf.get("bdot_function_detailed")
@@ -597,7 +410,7 @@ def main() -> int:
     ap.add_argument("--powuzyt-col", default="bud_pow_uzyt")
     ap.add_argument("--out", default=None,
                     help="default: <budynki dir>/budynki_bdot10k.gpkg")
-    ap.add_argument("--cache-dir", default="data/processed/bdot10k/cache")
+    ap.add_argument("--cache-dir", default="data/raw/bdot10k/cache")
     ap.add_argument("--scratch-dir", default=None,
                     help="LOCAL disk dir for shards + GPKG assembly (default $TMPDIR). "
                          "Must be a real local filesystem -- NOT NFS -- because GPKG/"
@@ -609,23 +422,11 @@ def main() -> int:
     ap.add_argument("--usable-factor", type=float, default=DEFAULT_USABLE_FACTOR)
     ap.add_argument("--calibrate", action="store_true",
                     help="estimate usable factor k from rows that report bud_pow_uzyt")
-    ap.add_argument("--k-voiv", action="store_true",
-                    help="calibrate a SEPARATE k per voivodeship (voiv id = first 2 "
-                         "chars of teryt); implies --calibrate and prints every k")
     ap.add_argument("--only-powiats", default=None,
                     help="comma-separated TERYT codes (subset run)")
     ap.add_argument("--lokale", default=None,
                     help="path to lokale.gpkg to also enrich flats with building context")
     ap.add_argument("--lokale-layer", default="lokale")
-    ap.add_argument("--dzialki", default=None,
-                    help="path to dzialki.gpkg; also build budynki_dzialki_bdot10k.gpkg "
-                         "= BDOT buildings collected onto built-up RCN parcels")
-    ap.add_argument("--dzialki-layer", default="dzialki")
-    ap.add_argument("--dzialki-out", default=None,
-                    help="default: <dzialki dir>/budynki_dzialki_bdot10k.gpkg")
-    ap.add_argument("--parcel-min-frac", type=float, default=DEFAULT_PARCEL_MIN_FRAC,
-                    help="min fraction of a BDOT building footprint that must lie "
-                         "inside a parcel to assign it there")
     args = ap.parse_args()
 
     only = [s.strip() for s in args.only_powiats.split(",")] if args.only_powiats else None
@@ -656,19 +457,8 @@ def main() -> int:
 
     results = _run(tasks, args.workers)
 
-    # choose k (scalar, or a per-voivodeship dict when --k-voiv)
-    k_default = None
-    if args.k_voiv:
-        k, k_default, ktable = calibrate_k_by_voiv(
-            [{"powiat": r["powiat"], "ratios": r["ratios"]} for r in results],
-            args.usable_factor)
-        print("[calibration] per-voivodeship usable factor k "
-              "(voiv: k_hat  [n rows, source]):")
-        for v, kv, n, src in ktable:
-            print(f"    voiv {v}: k = {kv:.4f}   (n={n:,}, {src})")
-        print(f"    global-fallback k = {k_default:.4f}  "
-              f"(used for voivodeships absent above)")
-    elif args.calibrate:
+    # choose k
+    if args.calibrate:
         k, nk, ok = calibrate_k([r["ratios"] for r in results], args.usable_factor)
         if ok:
             print(f"[calibration] k_hat = {k:.3f}  (empirical median of "
@@ -681,8 +471,7 @@ def main() -> int:
         print(f"[factor] using fixed usable-factor k = {k}")
 
     shards = [r["shard"] for r in results]
-    n_out = assemble(shards, out, layer, k, scratch,
-                     teryt_col=args.teryt_col, k_default=k_default)
+    n_out = assemble(shards, out, layer, k, scratch)
 
     n_tot = sum(r["n"] for r in results)
     n_match = sum(r["matched"] for r in results)
@@ -716,51 +505,21 @@ def main() -> int:
         print(f"[lokale] rows {ln:,} | building matched {lm:,}/{lt:,} "
               f"({100*lm/max(lt,1):.1f}%) -> {lout.resolve()}")
 
-    # -------------------------------------------------------- dzialki (opt)
-    # Collect BDOT buildings sitting on built-up RCN parcels. Reuses the same
-    # calibrated k and the same BDOT download cache; output is building-level.
-    if args.dzialki:
-        dsrc = args.dzialki
-        dlayer = args.dzialki_layer
-        dout = Path(args.dzialki_out) if args.dzialki_out \
-            else Path(dsrc).with_name("budynki_dzialki_bdot10k.gpkg")
-        dshard = scratch / "_shards_dzialki"; dshard.mkdir(parents=True, exist_ok=True)
-        dpow = list_powiats(dsrc, dlayer, args.teryt_col, only)
-        print(f"\n[dzialki] {len(dpow)} powiats; collecting BDOT buildings onto built-up "
-              f"parcels {BUILDUP_KINDS} (>= {args.parcel_min_frac:.0%} of building inside)")
-        dtasks = [dict(powiat=p, src=dsrc, layer=dlayer, teryt_col=args.teryt_col,
-                       cache_dir=str(cache_dir), shard_dir=str(dshard),
-                       out_layer="budynki_dzialki", min_frac=args.parcel_min_frac,
-                       kinds=BUILDUP_KINDS) for p in dpow]
-        dres = _run(dtasks, args.workers, worker=_worker_dzialki)
-        dn = assemble([r["shard"] for r in dres], dout, "budynki_dzialki", k, scratch,
-                      teryt_col="dzi_teryt", k_default=k_default)
-        d_parc = sum(r["n"] for r in dres)
-        derrs = [(r["powiat"], r["error"]) for r in dres if r["error"]]
-        print("=" * 70)
-        print(f"[dzialki] buildings collected: {dn:,} "
-              f"(from {d_parc:,} distinct built-up parcels)")
-        if derrs:
-            print(f"[dzialki] {len(derrs)} powiats had BDOT issues, e.g.:")
-            for p, e in derrs[:5]:
-                print(f"    {p}: {str(e).splitlines()[0]}")
-        print(f"[dzialki] OUTPUT -> {dout.resolve()}")
-
     return 0
 
 
-def _run(tasks, workers, worker=_worker):
+def _run(tasks, workers):
     if workers and workers > 1 and len(tasks) > 1:
         with mp.Pool(processes=workers) as pool:
             out = []
-            for i, r in enumerate(pool.imap_unordered(worker, tasks), 1):
+            for i, r in enumerate(pool.imap_unordered(_worker, tasks), 1):
                 tag = r["powiat"]
                 print(f"  [{i}/{len(tasks)}] powiat {tag}: "
                       f"{r['matched']}/{r['n']} matched"
                       + (f"  ERROR {str(r['error']).splitlines()[0]}" if r["error"] else ""))
                 out.append(r)
             return out
-    return [worker(t) for t in tasks]
+    return [_worker(t) for t in tasks]
 
 
 if __name__ == "__main__":
