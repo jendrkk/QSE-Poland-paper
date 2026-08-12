@@ -49,6 +49,7 @@ import pandas as pd
 import config as C
 from config import CleaningConfig, ModelConfig
 import rcn
+import houses
 import gus as gusmod
 import teryt as tercmod
 import spatial
@@ -128,6 +129,15 @@ def parse_args(argv=None):
     p.add_argument("--anchor", choices=["median", "mean"], default=ModelConfig.anchor,
                    help="GUS statistic used as the prior mean.")
     p.add_argument("--drop-public-sellers", action="store_true")
+    p.add_argument("--house-land-netting", choices=["subtract", "regress", "none"],
+                   default=CleaningConfig.house_land_netting,
+                   help="How to remove plot-land value from house prices.")
+    p.add_argument("--house-max-floors", type=int, default=CleaningConfig.house_max_floors,
+                   help="Max BDOT10k floors for a house obs (>=6 are mismatches/apartment blocks).")
+    p.add_argument("--house-use-nearest", action="store_true",
+                   help="Also use match_type='nearest' BDOT matches (noisy; off by default).")
+    p.add_argument("--no-dzialki-marginal", action="store_true",
+                   help="Do not recover marginal rural houses via dzialki+budynki_dzialki.")
     p.add_argument("--benchmark-to-gus", action="store_true",
                    help="Exact within-powiat rescale so weighted gmina mean = GUS.")
     p.add_argument("--bayes", action="store_true", help="Full MCMC area model (needs numpyro).")
@@ -160,38 +170,68 @@ def main(argv=None):
     cfg = CleaningConfig(
         year_min=args.year_min, year_max=args.year_max,
         drop_public_sellers=args.drop_public_sellers,
+        house_land_netting=args.house_land_netting,
+        house_max_floors=args.house_max_floors,
+        house_use_nearest=args.house_use_nearest,
+        use_dzialki_marginal_houses=not args.no_dzialki_marginal,
     )
     mcfg = ModelConfig(
         time_fe=args.time_fe, bayes=args.bayes,
         benchmark_to_gus=args.benchmark_to_gus, anchor=args.anchor,
     )
 
-    # ---- 1. micro + land ------------------------------------------------- #
+    # ---- 1. build micro sources ----------------------------------------- #
     LOGGER.info("STAGE 1  reading + cleaning RCN micro data")
-    micro = rcn.build_micro(cfg, workers=args.workers, sample_frac=args.sample_frac)
+    flats = rcn.build_flats(cfg, workers=args.workers, sample_frac=args.sample_frac)
+    houses_p = houses.build_houses_primary(cfg, workers=args.workers, sample_frac=args.sample_frac)
+    houses_m = houses.build_houses_marginal(
+        cfg, workers=args.workers,
+        exclude_tran_ids=houses.house_tran_ids_primary(houses_p),
+        sample_frac=args.sample_frac,
+    )
+    houses_raw = pd.concat([houses_p, houses_m], ignore_index=True)
     land = rcn.build_land(cfg, workers=args.workers, sample_frac=args.sample_frac)
 
-    # ---- 2. spatial join ------------------------------------------------- #
+    # ---- 2. spatial join to 2021 gminas --------------------------------- #
     LOGGER.info("STAGE 2  spatial assignment to 2021 gminas")
     communes = spatial.load_communes(C.COMMUNES_GPKG)
-    micro = spatial.assign_gmina(micro, communes, workers=args.workers)
-    micro = micro[micro["gmina_teryt"].notna()].copy()
-    land_cov = spatial.gmina_land_covariate(land, communes, workers=args.workers)
+    flats = spatial.assign_gmina(flats, communes, workers=args.workers)
+    flats = flats[flats["gmina_teryt"].notna()].copy()
+    if len(houses_raw):
+        houses_raw = spatial.assign_gmina(houses_raw, communes, workers=args.workers)
+    land = spatial.assign_gmina(land, communes, workers=args.workers)
 
-    # ---- 3. covariates --------------------------------------------------- #
-    LOGGER.info("STAGE 3  GUS anchor + gmina covariates")
+    # ---- 3. land-price surface + house land-netting --------------------- #
+    LOGGER.info("STAGE 3  land-price surface + house land-netting")
+    land_surface = houses.build_land_surface(land, communes["gmina_teryt"], cfg)
+    houses_net = houses.net_land(houses_raw, land_surface, cfg) if len(houses_raw) else houses_raw
+
+    # pool flats + houses into one micro table
+    common = rcn.MICRO_COLS + ["gmina_teryt"]
+    micro = pd.concat(
+        [flats[common], houses_net[common]] if len(houses_net) else [flats[common]],
+        ignore_index=True,
+    )
+    micro = rcn.robust_trim(micro, cfg)
+    LOGGER.info("MICRO pooled: %s (flats=%s, houses=%s)", f"{len(micro):,}",
+                f"{(micro.source=='flat').sum():,}",
+                f"{(micro.source!='flat').sum():,}")
+
+    # ---- 4. GUS anchor + gmina covariates ------------------------------- #
+    LOGGER.info("STAGE 4  GUS anchor + gmina covariates")
     gus_long = gusmod.load_gus_long(C.GUS_MEDIAN_CSV, C.GUS_MEAN_CSV)
     gus_anchor = gusmod.powiat_anchor(gus_long, C.REFERENCE_YEAR)
     if args.anchor == "mean":
         gus_anchor = gus_anchor.assign(gus_median=gus_anchor["gus_mean"])
     terc = tercmod.load_terc(C.TERC_2021_CSV)
     communes_pop = communes.drop(columns="geometry")
-    covariates = build_gmina_covariates(communes_pop, land_cov, gus_anchor, terc)
+    covariates = build_gmina_covariates(communes_pop, land_surface, gus_anchor, terc)
 
-    # ---- 4. hedonic ------------------------------------------------------ #
-    LOGGER.info("STAGE 4  national hedonic (gmina + %s FE)", args.time_fe)
+    # ---- 4b. hedonic ---------------------------------------------------- #
+    LOGGER.info("STAGE 4b national hedonic (gmina + %s FE)", args.time_fe)
     direct, hinfo = estimate.fit_hedonic(
-        micro, time_fe=args.time_fe, ridge=mcfg.ridge, ref_year=C.REFERENCE_YEAR
+        micro, time_fe=args.time_fe, ridge=mcfg.ridge, ref_year=C.REFERENCE_YEAR,
+        plot_regressor=(cfg.house_land_netting == "regress"),
     )
 
     # ---- 5. Fay-Herriot -------------------------------------------------- #
@@ -201,6 +241,15 @@ def main(argv=None):
     index = index.merge(covariates[["gmina_teryt", "powiat", "pop", "rodz_class", "gus_median"]],
                         on="gmina_teryt", how="left")
     index = index.merge(terc[["teryt7", "nazwa"]].rename(columns={"teryt7": "gmina_teryt"}),
+                        on="gmina_teryt", how="left")
+    # per-gmina source composition (n flats / houses)
+    src = (micro.assign(kind=np.where(micro["source"] == "flat", "n_flats", "n_houses"))
+                .groupby(["gmina_teryt", "kind"]).size().unstack(fill_value=0).reset_index())
+    index = index.merge(src, on="gmina_teryt", how="left")
+    for c in ("n_flats", "n_houses"):
+        if c in index:
+            index[c] = index[c].fillna(0).astype(int)
+    index = index.merge(land_surface[["gmina_teryt", "land_level", "land_ppm2"]],
                         on="gmina_teryt", how="left")
 
     # ---- 6. optional benchmark ------------------------------------------ #
@@ -215,7 +264,7 @@ def main(argv=None):
     ordered = [
         "gmina_teryt", "nazwa", "powiat", "rodz_class", "index_zl_m2",
         "theta_tilde", "theta_sd", "shrinkage_to_data", "has_rcn", "n_obs",
-        "gus_median", "pop",
+        "n_flats", "n_houses", "gus_median", "land_ppm2", "land_level", "pop",
     ]
     ordered = [c for c in ordered if c in index.columns]
     tab = index[ordered].sort_values("gmina_teryt")
@@ -233,8 +282,12 @@ def main(argv=None):
     write_gpkg_nfs_safe(gdf, gpkg_path, tmp_dir=args.tmp_dir)
 
     # diagnostics
+    src_counts = micro["source"].value_counts().to_dict()
     diag = {
         "n_micro": int(hinfo["n"]),
+        "n_flats": int(src_counts.get("flat", 0)),
+        "n_houses_primary": int(src_counts.get("house_budynki", 0)),
+        "n_houses_marginal": int(src_counts.get("house_dzialki", 0)),
         "n_gminas_direct": int(hinfo["n_gminas"]),
         "n_gminas_total": int(len(index)),
         "n_gminas_pure_gus": int((~index["has_rcn"]).sum()),
@@ -245,8 +298,12 @@ def main(argv=None):
         "time_coef": {k: float(v) for k, v in hinfo["time_coef"].items()},
         "median_shrinkage_to_data": float(np.nanmedian(index["shrinkage_to_data"])),
         "index_median_zl_m2": float(np.nanmedian(index["index_zl_m2"])),
+        "land_level_counts": land_surface["land_level"].value_counts().to_dict(),
         "config": {"year_min": cfg.year_min, "year_max": cfg.year_max,
                     "time_fe": mcfg.time_fe, "anchor": mcfg.anchor,
+                    "house_land_netting": cfg.house_land_netting,
+                    "house_max_floors": cfg.house_max_floors,
+                    "use_dzialki_marginal": cfg.use_dzialki_marginal_houses,
                     "benchmark_to_gus": mcfg.benchmark_to_gus,
                     "sample_frac": args.sample_frac},
     }

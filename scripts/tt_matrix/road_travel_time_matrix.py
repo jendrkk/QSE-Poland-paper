@@ -14,9 +14,10 @@ extensions -- endogenous road congestion (Allen-Arkolakis 2022 / BPR) and a
 second rail/PT mode from GTFS -- can be bolted on without rewriting it:
 
   * weight assignment is separated from routing behind ``edge_time()``, whose
-    signature already carries a ``load`` argument (a no-op at load == 0), so an
-    outer traffic-assignment loop can re-weight edges in place;
-  * a per-edge ``capacity`` attribute is populated even in the baseline;
+    signature already carries ``capacity``/``load`` arguments (a no-op at
+    load == 0), so an outer traffic-assignment loop can re-weight edges;
+  * a per-edge ``capacity`` attribute is populated even in the baseline and is
+    carried through contraction as the chain bottleneck (min);
   * centroid selection, snapping, commune aggregation, the diagonal imputation
     and the output format are engine- and mode-agnostic, so a future
     schedule-based rail engine can reuse everything except the graph build and
@@ -75,14 +76,15 @@ import shutil
 import sys
 import tempfile
 import time
+from array import array
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-# Heavy geo/graph deps are imported lazily inside main() so that --help and unit
-# imports stay cheap and the failure messages are precise.
+# Heavy geo/graph deps are imported lazily inside functions so --help stays cheap
+# and failure messages are precise.
 
 
 # --------------------------------------------------------------------------- #
@@ -106,6 +108,7 @@ CRS_WGS84 = "EPSG:4326"    # OSM node coordinates
 LOGGER = logging.getLogger("road_ttm")
 
 MPH_TO_KMH = 1.609344
+INF = float("inf")
 
 
 # --------------------------------------------------------------------------- #
@@ -142,7 +145,7 @@ DEFAULT_SPEED_PROFILE: dict[str, tuple[float, float]] = {
 # excluded. ``service`` is included at low speed for settlement access.
 DRIVABLE_CLASSES = set(DEFAULT_SPEED_PROFILE.keys())
 
-# Nominal lane capacities (veh/h/lane) by class -- stored per edge for the
+# Nominal lane capacities (veh/h/lane) by class -- carried per edge for the
 # future congestion extension, NOT used in the baseline weights.
 LANE_CAPACITY = {
     "motorway": 2000, "motorway_link": 1500,
@@ -186,7 +189,6 @@ def parse_maxspeed(raw) -> tuple[float | None, bool]:
     if s in ("walk", "foot"):
         return 5.0, True
 
-    # Lists: "50;70" / "50, 70" -> take the minimum sane token.
     tokens = re.split(r"[;,]", s)
     speeds: list[float] = []
     for tok in tokens:
@@ -208,20 +210,13 @@ def parse_maxspeed(raw) -> tuple[float | None, bool]:
     return None, False
 
 
-def resolve_way_speed(
-    tags: dict,
-    hwy: str,
-    builtup: bool,
-    profile: dict[str, tuple[float, float]],
-    speed_factor: float,
-) -> tuple[float, bool]:
-    """Free-flow speed (km/h) for a way and whether an explicit tag was used.
+def resolve_speed(ms_raw, hwy, builtup, profile, speed_factor):
+    """Free-flow speed (km/h) and whether an explicit maxspeed tag was used.
 
     Precedence: explicit ``maxspeed`` (as-is) -> class default (rural/built-up)
-    times ``speed_factor``. Falls back to a 40 km/h generic if the class is
-    unknown (should not happen for DRIVABLE_CLASSES).
+    times ``speed_factor``.
     """
-    ms, explicit = parse_maxspeed(tags.get("maxspeed"))
+    ms, explicit = parse_maxspeed(ms_raw)
     if ms is not None:
         return ms, True
     rural, urban = profile.get(hwy, (40.0, 40.0))
@@ -229,236 +224,85 @@ def resolve_way_speed(
     return base * speed_factor, False
 
 
-def edge_time(length_m: float, speed_kmh: float, capacity: float = 0.0,
-              load: float = 0.0) -> float:
-    """Edge traversal time in seconds.
+def edge_time(length_m, speed_kmh, capacity=0.0, load=0.0):
+    """Edge traversal time (seconds). Baseline: free-flow ``length / speed``.
 
-    Baseline: free-flow ``length / speed``. The ``capacity``/``load`` arguments
-    are the seam for the congestion extension -- a BPR term
+    ``capacity``/``load`` are the congestion seam -- a BPR term
     ``* (1 + alpha*(load/capacity)**beta)`` would multiply the free-flow time
-    here, driven by an outer traffic-assignment loop. They are inert at
-    ``load == 0``.
+    here, driven by an outer traffic-assignment loop. Inert at ``load == 0``.
     """
-    v = max(speed_kmh, 1.0) / 3.6  # m/s
-    t = length_m / v
-    return t
+    v = max(speed_kmh, 1.0) / 3.6
+    return length_m / v
 
 
-# --------------------------------------------------------------------------- #
-# Built-up ("obszar zabudowany") inference for ambiguous classes
-# --------------------------------------------------------------------------- #
-# A class is "ambiguous" when its rural and built-up defaults differ; only then
-# does built-up status change the imputed speed (and only when maxspeed is
-# missing).
 def ambiguous_classes(profile) -> set[str]:
+    """Classes whose rural and built-up defaults differ (built-up matters)."""
     return {k for k, (r, u) in profile.items() if r != u}
 
 
-_ZONE_URBAN = re.compile(r"urban|:urban|zone")
-_ZONE_RURAL = re.compile(r"rural|:rural")
+_ZONE_URBAN = re.compile(r"urban|zone")
+_ZONE_RURAL = re.compile(r"rural")
 
 
-def builtup_from_tags(tags: dict, hwy: str) -> bool | None:
-    """OSM-native built-up signal, or None if the tags say nothing.
-
-    residential / living_street are urban by construction. Otherwise look at
-    source:maxspeed / zone:maxspeed / zone:traffic for PL:urban vs PL:rural.
-    """
-    if hwy in ("residential", "living_street", "service"):
+def builtup_from_zone(zone) -> bool | None:
+    """Built-up signal from a source:maxspeed / zone:* tag, or None."""
+    if not zone:
+        return None
+    z = str(zone).lower()
+    if _ZONE_RURAL.search(z):
+        return False
+    if _ZONE_URBAN.search(z):
         return True
-    for key in ("source:maxspeed", "zone:maxspeed", "zone:traffic",
-                "maxspeed:type"):
-        v = tags.get(key)
-        if not v:
-            continue
-        v = str(v).lower()
-        if _ZONE_RURAL.search(v):
-            return False
-        if _ZONE_URBAN.search(v):
-            return True
     return None
 
 
 # --------------------------------------------------------------------------- #
-# PBF parsing
+# PBF parsing  (compact per-way tuples, only the tags we need)
 # --------------------------------------------------------------------------- #
 def parse_pbf_ways(network: Path):
-    """Read drivable ways from the PBF.
-
-    Returns ``ways`` = list of dicts with keys
-    ``nodes`` (list of osm node ids), ``lonlat`` (list of (lon, lat)),
-    ``hwy``, ``tags``. Node de-duplication and graph assembly happen later.
+    """Read drivable ways. Returns a list of tuples
+    ``(refs, lons, lats, hwy, maxspeed, oneway, junction, lanes, zone)``.
     """
     import osmium
 
     class RoadHandler(osmium.SimpleHandler):
         def __init__(self):
             super().__init__()
-            self.ways: list[dict] = []
+            self.ways: list[tuple] = []
             self.n_seen = 0
 
         def way(self, w):
             self.n_seen += 1
-            tags = {t.k: t.v for t in w.tags}
+            tags = w.tags
             hwy = tags.get("highway")
             if hwy not in DRIVABLE_CLASSES:
                 return
-            # Access restrictions that forbid general motor traffic.
             acc = tags.get("motor_vehicle") or tags.get("motorcar") or tags.get("access")
             if acc in _ACCESS_NO:
                 return
-            coords = [(n.ref, n.location.lon, n.location.lat)
-                      for n in w.nodes if n.location.valid()]
-            if len(coords) < 2:
+            refs, lons, lats = [], [], []
+            for n in w.nodes:
+                if n.location.valid():
+                    refs.append(n.ref)
+                    lons.append(n.location.lon)
+                    lats.append(n.location.lat)
+            if len(refs) < 2:
                 return
-            self.ways.append({
-                "nodes": [c[0] for c in coords],
-                "lonlat": [(c[1], c[2]) for c in coords],
-                "hwy": hwy,
-                "tags": tags,
-            })
+            zone = (tags.get("source:maxspeed") or tags.get("zone:maxspeed")
+                    or tags.get("zone:traffic") or tags.get("maxspeed:type"))
+            self.ways.append((refs, lons, lats, hwy,
+                              tags.get("maxspeed"),
+                              str(tags.get("oneway", "")).strip().lower(),
+                              str(tags.get("junction", "")).strip().lower(),
+                              tags.get("lanes"), zone))
 
     LOGGER.info("Parsing PBF (drivable ways): %s", network)
     t0 = time.time()
     h = RoadHandler()
-    # locations=True populates node coordinates on the way nodes.
     h.apply_file(str(network), locations=True)
-    LOGGER.info(
-        "  kept %s drivable ways of %s total ways (%.1fs)",
-        f"{len(h.ways):,}", f"{h.n_seen:,}", time.time() - t0,
-    )
+    LOGGER.info("  kept %s drivable ways of %s total ways (%.1fs)",
+                f"{len(h.ways):,}", f"{h.n_seen:,}", time.time() - t0)
     return h.ways
-
-
-# --------------------------------------------------------------------------- #
-# Graph assembly
-# --------------------------------------------------------------------------- #
-def build_graph(ways, profile, speed_factor, builtup_mode,
-                pop_tree, pop_cellsize, builtup_ambig_classes,
-                transformer_to_metric):
-    """Assemble a directed graph from parsed ways.
-
-    Returns a dict with:
-      ``n_nodes``            number of distinct nodes
-      ``node_lonlat``        (n_nodes, 2) float64 lon/lat
-      ``node_xy``            (n_nodes, 2) float64 EPSG:3035 (for snapping)
-      ``edges``              list of (u, v, length_m, time_s, capacity)
-      ``class_len``          dict class -> total one-way length (m)
-      ``class_len_explicit`` dict class -> length with explicit maxspeed (m)
-      ``ambiguous_len``      total length of ambiguous classes w/o maxspeed
-      ``builtup_len``        of that, length inferred built-up
-    """
-    from pyproj import Geod
-    geod = Geod(ellps="WGS84")
-
-    node_id_map: dict[int, int] = {}
-    node_lon: list[float] = []
-    node_lat: list[float] = []
-
-    def nid(osm_id, lon, lat):
-        k = node_id_map.get(osm_id)
-        if k is None:
-            k = len(node_lon)
-            node_id_map[osm_id] = k
-            node_lon.append(lon)
-            node_lat.append(lat)
-        return k
-
-    edges: list[tuple] = []
-    class_len: dict[str, float] = defaultdict(float)
-    class_len_explicit: dict[str, float] = defaultdict(float)
-    ambiguous_len = 0.0
-    builtup_len = 0.0
-
-    # Pre-compute built-up decision per way (representative midpoint).
-    for w in ways:
-        hwy = w["hwy"]
-        tags = w["tags"]
-        lonlat = w["lonlat"]
-        nodes = w["nodes"]
-
-        # Built-up inference (only matters for ambiguous classes w/o maxspeed).
-        builtup = False
-        is_ambig = hwy in builtup_ambig_classes
-        _, explicit = parse_maxspeed(tags.get("maxspeed"))
-        if is_ambig and not explicit and builtup_mode != "none":
-            b = builtup_from_tags(tags, hwy)
-            if b is None and builtup_mode == "grid" and pop_tree is not None:
-                mlon = lonlat[len(lonlat) // 2][0]
-                mlat = lonlat[len(lonlat) // 2][1]
-                mx, my = transformer_to_metric.transform(mlon, mlat)
-                dist, _ = pop_tree.query([mx, my], k=1)
-                b = bool(dist <= pop_cellsize)
-            builtup = bool(b) if b is not None else False
-        elif hwy in ("residential", "living_street", "service"):
-            builtup = True
-
-        speed, used_explicit = resolve_way_speed(
-            tags, hwy, builtup, profile, speed_factor)
-
-        # Oneway handling.
-        ow = str(tags.get("oneway", "")).strip().lower()
-        junction = str(tags.get("junction", "")).strip().lower()
-        forward = True
-        backward = True
-        if ow in _ONEWAY_YES or junction == "roundabout" or hwy == "motorway":
-            backward = False
-        if ow in _ONEWAY_REV:
-            forward, backward = False, True
-        if ow in ("no", "false", "0"):
-            forward = backward = True
-
-        lanes = tags.get("lanes")
-        try:
-            n_lanes = max(1, int(float(str(lanes).split(";")[0])))
-        except (TypeError, ValueError):
-            n_lanes = 2 if not (backward is False) else 1
-        cap = LANE_CAPACITY.get(hwy, 600) * n_lanes
-
-        # Per-segment geodesic lengths.
-        lons = [c[0] for c in lonlat]
-        lats = [c[1] for c in lonlat]
-        seg_len = _segment_lengths(geod, lons, lats)
-
-        for i in range(len(nodes) - 1):
-            L = seg_len[i]
-            if L <= 0:
-                continue
-            u = nid(nodes[i], lons[i], lats[i])
-            v = nid(nodes[i + 1], lons[i + 1], lats[i + 1])
-            if u == v:
-                continue
-            t = edge_time(L, speed, cap, 0.0)
-            if forward:
-                edges.append((u, v, L, t, cap))
-            if backward:
-                edges.append((v, u, L, t, cap))
-
-        # Statistics accumulate on the (undirected) way length once.
-        wlen = float(sum(seg_len))
-        class_len[hwy] += wlen
-        if used_explicit:
-            class_len_explicit[hwy] += wlen
-        if is_ambig and not used_explicit:
-            ambiguous_len += wlen
-            if builtup:
-                builtup_len += wlen
-
-    node_lon_a = np.asarray(node_lon, dtype=np.float64)
-    node_lat_a = np.asarray(node_lat, dtype=np.float64)
-    mx, my = transformer_to_metric.transform(node_lon_a, node_lat_a)
-    node_xy = np.column_stack([mx, my])
-
-    return {
-        "n_nodes": len(node_lon),
-        "node_lonlat": np.column_stack([node_lon_a, node_lat_a]),
-        "node_xy": node_xy,
-        "edges": edges,
-        "class_len": dict(class_len),
-        "class_len_explicit": dict(class_len_explicit),
-        "ambiguous_len": ambiguous_len,
-        "builtup_len": builtup_len,
-    }
 
 
 def _segment_lengths(geod, lons, lats) -> np.ndarray:
@@ -472,144 +316,331 @@ def _segment_lengths(geod, lons, lats) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
-# Degree-2 chain contraction (osmnx-style, direction-aware)
+# Graph assembly (vectorised, compact arrays)
 # --------------------------------------------------------------------------- #
-def simplify_graph(n_nodes: int, edges: list[tuple], protected: set[int]):
-    """Contract non-endpoint degree-2 chains, preserving cumulative time/length.
+def build_graph(ways, profile, speed_factor, builtup_mode,
+                pop_tree, pop_cellsize, ambig, to_metric):
+    """Assemble a directed graph from parsed ways.
 
-    ``edges`` = list of (u, v, length, time). A node is an endpoint (kept) if it
-    is protected, is an intersection / dead-end (undirected degree != 2), or has
-    an asymmetric in/out structure. Chains between endpoints are merged per
-    direction (a direction survives only if every step of the chain exists in
-    that direction -- so oneway chains stay oneway).
-
-    Returns ``(n_new, new_edges, old2new)`` where ``new_edges`` is a list of
-    (u, v, length, time) on the reindexed node set and ``old2new`` maps every
-    surviving old node id to its new id.
+    Returns a dict with node coordinates and directed-edge arrays
+    (``eu, ev`` int32 node ids; ``el`` length m; ``et`` time s; ``ec``
+    capacity veh/h) plus length/coverage statistics.
     """
-    de: dict[tuple[int, int], tuple[float, float]] = {}
-    und: dict[int, set[int]] = defaultdict(set)
-    for (u, v, l, t) in edges:
-        if u == v:
-            continue
-        key = (u, v)
-        cur = de.get(key)
-        if cur is None or t < cur[1]:
-            de[key] = (l, t)
-        und[u].add(v)
-        und[v].add(u)
+    from pyproj import Geod
+    geod = Geod(ellps="WGS84")
 
-    outdeg: dict[int, int] = defaultdict(int)
-    indeg: dict[int, int] = defaultdict(int)
-    for (u, v) in de:
-        outdeg[u] += 1
-        indeg[v] += 1
+    nmap: dict[int, int] = {}
+    nlon = array("d")
+    nlat = array("d")
 
-    def is_endpoint(n: int) -> bool:
-        if n in protected:
-            return True
-        nb = und[n]
-        if len(nb) != 2:
-            return True
-        i, o = indeg[n], outdeg[n]
-        if i != o or i not in (1, 2):
-            return True
-        return False
+    def nid(o, lon, lat):
+        k = nmap.get(o)
+        if k is None:
+            k = len(nlon)
+            nmap[o] = k
+            nlon.append(lon)
+            nlat.append(lat)
+        return k
 
-    endpoints = {n for n in und if is_endpoint(n)}
+    # Pass 1: decide built-up per way (batched population-grid query).
+    n_ways = len(ways)
+    builtup = [False] * n_ways
+    ambig_unres = [False] * n_ways
+    grid_idx: list[int] = []
+    grid_mid: list[tuple[float, float]] = []
+    for wi, w in enumerate(ways):
+        hwy, ms, zone = w[3], w[4], w[8]
+        _, explicit = parse_maxspeed(ms)
+        if hwy in ("residential", "living_street", "service"):
+            builtup[wi] = True
+        if hwy in ambig and not explicit and builtup_mode != "none":
+            ambig_unres[wi] = True
+            sig = builtup_from_zone(zone)
+            if sig is not None:
+                builtup[wi] = sig
+            elif builtup_mode == "grid" and pop_tree is not None:
+                lons, lats = w[1], w[2]
+                grid_idx.append(wi)
+                grid_mid.append((lons[len(lons) // 2], lats[len(lats) // 2]))
+    if grid_idx:
+        arr = np.asarray(grid_mid)
+        mx, my = to_metric.transform(arr[:, 0], arr[:, 1])
+        d, _ = pop_tree.query(np.column_stack([mx, my]), k=1)
+        for j, wi in enumerate(grid_idx):
+            builtup[wi] = bool(d[j] <= pop_cellsize)
 
-    new_edges: list[tuple] = []
-    visited_seg: set[frozenset] = set()
+    # Pass 2: emit directed edges.
+    eu, ev = array("i"), array("i")
+    el, et, ec = array("f"), array("f"), array("f")
+    class_len: dict[str, float] = defaultdict(float)
+    class_len_exp: dict[str, float] = defaultdict(float)
+    ambiguous_len = 0.0
+    builtup_len = 0.0
 
-    for u in endpoints:
-        for v in list(und[u]):
-            seg0 = frozenset((u, v))
-            if seg0 in visited_seg:
+    for wi, w in enumerate(ways):
+        refs, lons, lats, hwy, ms, ow, junc, lanes, _zone = w
+        bu = builtup[wi]
+        speed, used_explicit = resolve_speed(ms, hwy, bu, profile, speed_factor)
+
+        forward = backward = True
+        if ow in _ONEWAY_YES or junc == "roundabout" or hwy == "motorway":
+            backward = False
+        if ow in _ONEWAY_REV:
+            forward, backward = False, True
+        if ow in ("no", "false", "0"):
+            forward = backward = True
+
+        try:
+            n_lanes = max(1, int(float(str(lanes).split(";")[0])))
+        except (TypeError, ValueError):
+            n_lanes = 1 if not backward else 2
+        cap = float(LANE_CAPACITY.get(hwy, 600) * n_lanes)
+
+        seg = _segment_lengths(geod, lons, lats)
+        for i in range(len(refs) - 1):
+            L = float(seg[i])
+            if L <= 0:
                 continue
-            visited_seg.add(seg0)
-            path = [u, v]
-            prev, cur = u, v
-            while cur not in endpoints:
-                nxts = [w for w in und[cur] if w != prev]
-                if not nxts:
-                    break
-                nxt = nxts[0]
-                visited_seg.add(frozenset((cur, nxt)))
-                path.append(nxt)
-                prev, cur = cur, nxt
-                if cur == u:  # closed loop back to start
-                    break
-            F = path[-1]
-            # Forward u -> ... -> F.
-            fl = ft = 0.0
-            fwd_ok = True
-            for a, b in zip(path, path[1:]):
-                e = de.get((a, b))
-                if e is None:
-                    fwd_ok = False
-                    break
-                fl += e[0]
-                ft += e[1]
-            if fwd_ok:
-                new_edges.append((u, F, fl, ft))
-            # Backward F -> ... -> u.
-            bl = bt = 0.0
-            bwd_ok = True
-            for a, b in zip(path, path[1:]):
-                e = de.get((b, a))
-                if e is None:
-                    bwd_ok = False
-                    break
-                bl += e[0]
-                bt += e[1]
-            if bwd_ok:
-                new_edges.append((F, u, bl, bt))
+            u = nid(refs[i], lons[i], lats[i])
+            v = nid(refs[i + 1], lons[i + 1], lats[i + 1])
+            if u == v:
+                continue
+            t = edge_time(L, speed)
+            if forward:
+                eu.append(u); ev.append(v); el.append(L); et.append(t); ec.append(cap)
+            if backward:
+                eu.append(v); ev.append(u); el.append(L); et.append(t); ec.append(cap)
 
-    # Leftover segments (isolated interior cycles): keep uncontracted.
-    for (u, v), (l, t) in de.items():
-        if frozenset((u, v)) not in visited_seg:
-            new_edges.append((u, v, l, t))
+        wlen = float(seg.sum())
+        class_len[hwy] += wlen
+        if used_explicit:
+            class_len_exp[hwy] += wlen
+        if ambig_unres[wi]:
+            ambiguous_len += wlen
+            if bu:
+                builtup_len += wlen
 
-    survive: set[int] = set(endpoints)
-    for (u, v, _l, _t) in new_edges:
-        survive.add(u)
-        survive.add(v)
-    old2new = {old: i for i, old in enumerate(sorted(survive))}
-    remapped = [(old2new[u], old2new[v], l, t) for (u, v, l, t) in new_edges]
-    return len(old2new), remapped, old2new
+    eu = np.frombuffer(eu, dtype=np.int32)
+    ev = np.frombuffer(ev, dtype=np.int32)
+    el = np.frombuffer(el, dtype=np.float32)
+    et = np.frombuffer(et, dtype=np.float32)
+    ec = np.frombuffer(ec, dtype=np.float32)
+    lon_a = np.frombuffer(nlon, dtype=np.float64)
+    lat_a = np.frombuffer(nlat, dtype=np.float64)
+    mx, my = to_metric.transform(lon_a, lat_a)
+
+    return {
+        "n_nodes": len(lon_a),
+        "node_xy": np.column_stack([mx, my]),
+        "eu": eu, "ev": ev, "el": el, "et": et, "ec": ec,
+        "class_len": dict(class_len),
+        "class_len_explicit": dict(class_len_exp),
+        "ambiguous_len": ambiguous_len,
+        "builtup_len": builtup_len,
+    }
 
 
 # --------------------------------------------------------------------------- #
-# igraph construction + strongly-connected core
+# Giant strongly-connected component (scipy, memory-light)
 # --------------------------------------------------------------------------- #
-def giant_scc(n_nodes: int, edges: list[tuple]):
-    """Return (members_old_idx, sub_edges) for the largest strongly-connected
-    component. ``sub_edges`` uses the ORIGINAL node ids (filtered to members).
+def giant_scc(n, eu, ev, el, et, ec):
+    """Return ``members`` (old node ids) and SCC-reindexed edge arrays."""
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    A = csr_matrix((np.ones(len(eu), dtype=np.int8),
+                    (eu.astype(np.int64), ev.astype(np.int64))), shape=(n, n))
+    ncomp, labels = connected_components(A, directed=True, connection="strong")
+    counts = np.bincount(labels)
+    giant = int(np.argmax(counts))
+    members = np.nonzero(labels == giant)[0]
+
+    old2scc = np.full(n, -1, dtype=np.int64)
+    old2scc[members] = np.arange(len(members))
+    keep = (old2scc[eu] >= 0) & (old2scc[ev] >= 0)
+    su = old2scc[eu[keep]].astype(np.int32)
+    sv = old2scc[ev[keep]].astype(np.int32)
+    return members, su, sv, el[keep], et[keep], ec[keep], counts
+
+
+# --------------------------------------------------------------------------- #
+# Degree-2 chain contraction (vectorised CSR, direction- & capacity-aware)
+# --------------------------------------------------------------------------- #
+def simplify_graph(n, u, v, length, time_s, cap, protected_mask):
+    """Contract non-endpoint degree-2 chains, preserving cumulative time/length
+    and the bottleneck (min) capacity, keeping oneway chains oneway.
+
+    Returns ``(n_new, (ru, rv, rl, rt, rc), old2new)``. A node is an endpoint if
+    it is protected, an intersection / dead-end (undirected degree != 2), or has
+    asymmetric in/out structure. old2new maps surviving old ids to new ids.
     """
+    m = len(u)
+    empty = (np.array([], np.int32), np.array([], np.int32),
+             np.array([], np.float64), np.array([], np.float64),
+             np.array([], np.float64))
+    if m == 0:
+        return 0, empty, np.full(n, -1, np.int64)
+
+    u = u.astype(np.int64); v = v.astype(np.int64)
+    length = length.astype(np.float64); time_s = time_s.astype(np.float64)
+    cap = cap.astype(np.float64)
+
+    # Dedup directed parallels: keep first occurrence per (u, v).
+    key = u * n + v
+    order = np.argsort(key, kind="stable")
+    ks = key[order]
+    firstmask = np.empty(len(ks), bool)
+    firstmask[0] = True
+    firstmask[1:] = ks[1:] != ks[:-1]
+    sel = order[firstmask]
+    du, dv = u[sel], v[sel]
+    dl, dt, dc = length[sel], time_s[sel], cap[sel]
+
+    # Undirected pair ids.
+    a = np.minimum(du, dv)
+    b = np.maximum(du, dv)
+    is_fwd = du < dv
+    uk = a * n + b
+    ordu = np.argsort(uk, kind="stable")
+    uks = uk[ordu]
+    newp = np.empty(len(uks), bool)
+    newp[0] = True
+    newp[1:] = uks[1:] != uks[:-1]
+    pid_sorted = np.cumsum(newp) - 1
+    pid = np.empty(len(uk), np.int64)
+    pid[ordu] = pid_sorted
+    P = int(pid_sorted[-1]) + 1
+
+    pa = np.empty(P, np.int64); pb = np.empty(P, np.int64)
+    pa[pid] = a; pb[pid] = b
+    ft = np.full(P, INF); fl = np.full(P, INF); fc = np.full(P, INF)
+    bt = np.full(P, INF); bl = np.full(P, INF); bc = np.full(P, INF)
+    fw = is_fwd
+    ft[pid[fw]] = dt[fw]; fl[pid[fw]] = dl[fw]; fc[pid[fw]] = dc[fw]
+    bw = ~is_fwd
+    bt[pid[bw]] = dt[bw]; bl[pid[bw]] = dl[bw]; bc[pid[bw]] = dc[bw]
+
+    # Half-edges (both endpoints) -> CSR adjacency by source node.
+    src = np.concatenate([pa, pb])
+    dst = np.concatenate([pb, pa])
+    hft = np.concatenate([ft, bt]); hfl = np.concatenate([fl, bl]); hfc = np.concatenate([fc, bc])
+    hbt = np.concatenate([bt, ft]); hbl = np.concatenate([bl, fl])
+    hpid = np.concatenate([np.arange(P), np.arange(P)])
+
+    o = np.argsort(src, kind="stable")
+    src_s = src[o]; dst_s = dst[o]
+    ft_s = hft[o]; fl_s = hfl[o]; fc_s = hfc[o]
+    bt_s = hbt[o]; bl_s = hbl[o]; pid_s = hpid[o]
+    del src, dst, hft, hfl, hfc, hbt, hbl, hpid, o
+    del key, order, ks, sel, du, dv, dl, dt, dc, a, b, is_fwd, uk, ordu, uks
+    del pid_sorted, pid, fw, bw
+
+    indptr = np.zeros(n + 1, np.int64)
+    np.add.at(indptr, src_s + 1, 1)
+    np.cumsum(indptr, out=indptr)
+
+    und_deg = indptr[1:] - indptr[:-1]
+    out_deg = np.zeros(n, np.int64)
+    in_deg = np.zeros(n, np.int64)
+    np.add.at(out_deg, src_s, np.isfinite(ft_s).astype(np.int64))
+    np.add.at(in_deg, src_s, np.isfinite(bt_s).astype(np.int64))
+
+    endpoint = protected_mask.copy()
+    endpoint |= (und_deg != 2)
+    endpoint |= (in_deg != out_deg)
+    endpoint |= ~np.isin(in_deg, (1, 2))
+
+    ep_nodes = np.nonzero(endpoint & (und_deg > 0))[0]
+
+    # Compact C-typed copies for the walk: array.array indexing is fast AND
+    # ~40x lighter than list-of-Python-objects (.tolist() on multi-million
+    # arrays would add >1 GB). Free the numpy CSR/degree arrays afterwards.
+    dst_a = array("i", dst_s.astype(np.int32).tobytes())
+    ft_a = array("f", ft_s.astype(np.float32).tobytes())
+    fl_a = array("f", fl_s.astype(np.float32).tobytes())
+    fc_a = array("f", fc_s.astype(np.float32).tobytes())
+    bt_a = array("f", bt_s.astype(np.float32).tobytes())
+    bl_a = array("f", bl_s.astype(np.float32).tobytes())
+    pid_a = array("i", pid_s.astype(np.int32).tobytes())
+    indptr_a = array("q", indptr.astype(np.int64).tobytes())
+    endp_a = bytearray(endpoint.astype(np.uint8).tobytes())
+    ep_list = ep_nodes.tolist()
+    del dst_s, ft_s, fl_s, fc_s, bt_s, bl_s, pid_s
+    del und_deg, out_deg, in_deg, indptr, endpoint, ep_nodes
+
+    seg_visited = bytearray(P)
+    nu: list[int] = []; nv: list[int] = []
+    nl: list[float] = []; nt: list[float] = []; nc: list[float] = []
+
+    for u0 in ep_list:
+        for p in range(indptr_a[u0], indptr_a[u0 + 1]):
+            pid0 = pid_a[p]
+            if seg_visited[pid0]:
+                continue
+            seg_visited[pid0] = 1
+            v0 = dst_a[p]
+            fp = ft_a[p]; f_ok = fp != INF; ft_sum = fp; fl_sum = fl_a[p]; fc_min = fc_a[p]
+            bp = bt_a[p]; b_ok = bp != INF; bt_sum = bp; bl_sum = bl_a[p]
+            prev, cur = u0, v0
+            while not endp_a[cur]:
+                nxt = -1; pp = -1
+                for q in range(indptr_a[cur], indptr_a[cur + 1]):
+                    if dst_a[q] != prev:
+                        nxt = dst_a[q]; pp = q
+                        break
+                if nxt == -1:
+                    break
+                seg_visited[pid_a[pp]] = 1
+                fpp = ft_a[pp]
+                if fpp != INF:
+                    ft_sum += fpp; fl_sum += fl_a[pp]
+                    cpp = fc_a[pp]
+                    if cpp < fc_min:
+                        fc_min = cpp
+                else:
+                    f_ok = False
+                bpp = bt_a[pp]
+                if bpp != INF:
+                    bt_sum += bpp; bl_sum += bl_a[pp]
+                else:
+                    b_ok = False
+                prev, cur = cur, nxt
+                if cur == u0:
+                    break
+            F = cur
+            if f_ok:
+                nu.append(u0); nv.append(F); nl.append(fl_sum); nt.append(ft_sum); nc.append(fc_min)
+            if b_ok:
+                nu.append(F); nv.append(u0); nl.append(bl_sum); nt.append(bt_sum); nc.append(fc_min)
+
+    # Leftover pairs (isolated interior cycles with no endpoint): keep raw.
+    left = np.nonzero(np.frombuffer(bytes(seg_visited), dtype=np.uint8) == 0)[0]
+    for pidx in left.tolist():
+        if ft[pidx] != INF:
+            nu.append(int(pa[pidx])); nv.append(int(pb[pidx]))
+            nl.append(float(fl[pidx])); nt.append(float(ft[pidx])); nc.append(float(fc[pidx]))
+        if bt[pidx] != INF:
+            nu.append(int(pb[pidx])); nv.append(int(pa[pidx]))
+            nl.append(float(bl[pidx])); nt.append(float(bt[pidx])); nc.append(float(bc[pidx]))
+
+    nu = np.asarray(nu, np.int64); nv = np.asarray(nv, np.int64)
+    if len(nu) == 0:
+        return 0, empty, np.full(n, -1, np.int64)
+    survive = np.unique(np.concatenate([nu, nv]))
+    old2new = np.full(n, -1, np.int64)
+    old2new[survive] = np.arange(len(survive))
+    ru = old2new[nu].astype(np.int32)
+    rv = old2new[nv].astype(np.int32)
+    return len(survive), (ru, rv, np.asarray(nl), np.asarray(nt), np.asarray(nc)), old2new
+
+
+def build_igraph(n_nodes, ru, rv, rl, rt, rc):
     import igraph
-
-    g = igraph.Graph(n=n_nodes,
-                     edges=[(u, v) for (u, v, *_r) in edges],
+    g = igraph.Graph(n=n_nodes, edges=list(zip(ru.tolist(), rv.tolist())),
                      directed=True)
-    comp = g.connected_components(mode="strong")
-    sizes = comp.sizes()
-    giant = int(np.argmax(sizes))
-    membership = np.asarray(comp.membership)
-    keep = membership == giant
-    members = np.nonzero(keep)[0]
-    member_set = set(members.tolist())
-    sub_edges = [(u, v, l, t) for (u, v, l, t, *_c) in edges
-                 if u in member_set and v in member_set]
-    return members, sub_edges, sizes
-
-
-def build_igraph(n_nodes: int, edges: list[tuple]):
-    import igraph
-    g = igraph.Graph(n=n_nodes,
-                     edges=[(e[0], e[1]) for e in edges],
-                     directed=True)
-    g.es["time"] = [float(e[3]) for e in edges]
-    g.es["length"] = [float(e[2]) for e in edges]
+    g.es["time"] = rt.tolist()
+    g.es["length"] = rl.tolist()
+    g.es["capacity"] = rc.tolist()
     return g
 
 
@@ -628,19 +659,18 @@ def _load_worker_graph(path: str):
     return g
 
 
-def _route_batch(graph_path: str, sources: list[int], targets: list[int]):
+def _route_batch(graph_path, sources, targets):
     g = _load_worker_graph(graph_path)
     d = g.distances(source=sources, target=targets, weights="time")
     return np.asarray(d, dtype=np.float64)
 
 
-def route_matrix(graph, source_nodes, target_nodes, workers: int,
-                 tmp_dir: Path | None):
-    """Seconds matrix (len(source) x len(target)) via parallel igraph Dijkstra.
+def route_matrix(graph, nodes, workers, tmp_dir):
+    """Seconds matrix (len(nodes) x len(nodes)) via parallel igraph Dijkstra.
 
     The contracted graph is pickled once and lazily loaded per worker (loky
-    reuses workers, so it is read at most once each), which avoids pickling the
-    graph per task while keeping per-worker memory to a single copy.
+    reuses workers, so it is read at most once each); ``distances`` returns only
+    the target columns, so per-worker memory stays small.
     """
     from joblib import Parallel, delayed
 
@@ -650,19 +680,14 @@ def route_matrix(graph, source_nodes, target_nodes, workers: int,
     try:
         graph.write_pickle(str(gpath))
         n_jobs = workers if workers > 0 else (os.cpu_count() or 4)
-        src = list(source_nodes)
-        tgt = list(target_nodes)
-        n_batches = max(n_jobs * 4, 1)
-        batches = [b.tolist() for b in np.array_split(np.asarray(src), n_batches)
-                   if len(b)]
-        LOGGER.info(
-            "Routing %d x %d (sec) | workers=%d | batches=%d",
-            len(src), len(tgt), n_jobs, len(batches),
-        )
+        nodes = list(nodes)
+        batches = [b.tolist() for b in np.array_split(np.asarray(nodes),
+                                                      max(n_jobs * 4, 1)) if len(b)]
+        LOGGER.info("Routing %d x %d (sec) | workers=%d | batches=%d",
+                    len(nodes), len(nodes), n_jobs, len(batches))
         t0 = time.time()
         parts = Parallel(n_jobs=n_jobs, backend="loky")(
-            delayed(_route_batch)(str(gpath), batch, tgt) for batch in batches
-        )
+            delayed(_route_batch)(str(gpath), batch, nodes) for batch in batches)
         D = np.vstack(parts)
         LOGGER.info("  routing done in %.1fs", time.time() - t0)
         return D
@@ -674,13 +699,8 @@ def route_matrix(graph, source_nodes, target_nodes, workers: int,
 # Centroid selection
 # --------------------------------------------------------------------------- #
 def select_points(communes, candidates, id_col, centroid_type, n_centroids):
-    """Return an ordered commune id list and, per commune, a list of
-    ``(x, y, weight)`` in EPSG:3035 (weights sum to 1 within a commune).
-
-    Modes: unweighted -> geometric centroid; pop-weighted -> weighted_centroid;
-    best-pop -> rank-1 population candidate; multiple -> up to N candidates,
-    population-weighted.
-    """
+    """Return (ordered commune id list, {cid: [(x, y, weight), ...]}) in
+    EPSG:3035 with weights summing to 1 within each commune."""
     import shapely.wkt as wkt
 
     ids = list(communes[id_col].astype(str))
@@ -688,23 +708,22 @@ def select_points(communes, candidates, id_col, centroid_type, n_centroids):
 
     if centroid_type in ("unweighted", "pop-weighted"):
         col = "centroid" if centroid_type == "unweighted" else "weighted_centroid"
-        for cid, w in zip(communes[id_col].astype(str), communes[col]):
-            g = wkt.loads(w) if isinstance(w, str) else w
+        for cid, val in zip(communes[id_col].astype(str), communes[col]):
+            g = wkt.loads(val) if isinstance(val, str) else val
             per[cid] = [(g.x, g.y, 1.0)]
         return ids, per
 
-    # best-pop / multiple use the candidate layer.
     if candidates is None:
-        raise ValueError("centroid-type needs the commune_candidates layer")
+        raise ValueError("--centroid-type needs the commune_candidates layer")
     cand = candidates.sort_values([id_col, "cand_rank"])
     take = 1 if centroid_type == "best-pop" else max(1, n_centroids)
     grouped = {str(cid): sub for cid, sub in cand.groupby(id_col, sort=False)}
+    cent_lookup = dict(zip(communes[id_col].astype(str), communes["centroid"]))
 
     for cid in ids:
         sub = grouped.get(cid)
         if sub is None or len(sub) == 0:
-            # Fallback: geometric centroid.
-            g = communes.loc[communes[id_col].astype(str) == cid, "centroid"].iloc[0]
+            g = cent_lookup[cid]
             gg = wkt.loads(g) if isinstance(g, str) else g
             per[cid] = [(gg.x, gg.y, 1.0)]
             continue
@@ -719,39 +738,44 @@ def select_points(communes, candidates, id_col, centroid_type, n_centroids):
     return ids, per
 
 
-# --------------------------------------------------------------------------- #
-# Aggregation to commune x commune
-# --------------------------------------------------------------------------- #
-def aggregate(ids, per_points, snap_node, unique_nodes, D_sec):
-    """Collapse the node-level seconds matrix to a commune x commune minutes
-    matrix via T = A D A^T, A = row-normalised commune x node weight matrix.
-
-    ``snap_node`` maps a point key (cid, k) -> index into ``unique_nodes``.
-    ``D_sec`` is (U x U) seconds over ``unique_nodes``.
-    """
+def aggregate(ids, per_points, snap_pos, n_unique, D_sec):
+    """Collapse the node-level seconds matrix to commune x commune minutes via
+    T = A D A^T, A = row-normalised commune x node weight matrix."""
     import scipy.sparse as sp
 
     n = len(ids)
-    U = len(unique_nodes)
     rows, cols, vals = [], [], []
     for i, cid in enumerate(ids):
         for k, (_x, _y, w) in enumerate(per_points[cid]):
-            j = snap_node[(cid, k)]
             rows.append(i)
-            cols.append(j)
+            cols.append(snap_pos[(cid, k)])
             vals.append(w)
-    A = sp.csr_matrix((vals, (rows, cols)), shape=(n, U))
-    # A already row-normalised (weights sum to 1 per commune).
-    T = A @ (D_sec @ A.T)          # (n x n) seconds
-    return np.asarray(T) / 60.0    # minutes
+    A = sp.csr_matrix((vals, (rows, cols)), shape=(n, n_unique))
+    T = A @ (D_sec @ A.T)
+    return np.asarray(T) / 60.0
+
+
+# --------------------------------------------------------------------------- #
+# Diagonal imputation (ARSW self-commute)
+# --------------------------------------------------------------------------- #
+def diagonal_times(communes, id_col, ids, intra_speed_kmh, min_minutes):
+    """t_nn = (2/3) * sqrt(Area/pi) / v * 60, floored, area from EPSG:3035."""
+    area = dict(zip(communes[id_col].astype(str),
+                    communes.geometry.area.to_numpy()))
+    out = np.empty(len(ids))
+    for i, cid in enumerate(ids):
+        r_km = math.sqrt(max(area.get(cid, 0.0), 0.0) / math.pi) / 1000.0
+        t = (2.0 / 3.0) * r_km / max(intra_speed_kmh, 1.0) * 60.0
+        out[i] = max(t, min_minutes)
+    return out
 
 
 # --------------------------------------------------------------------------- #
 # Validation verdict
 # --------------------------------------------------------------------------- #
-def network_verdict(stats: dict, snap_dist: np.ndarray, args) -> tuple[str, list[str]]:
+def network_verdict(stats, snap_dist, args):
     reasons: list[str] = []
-    level = 0  # 0 good, 1 caveat, 2 bad
+    level = 0
 
     lcc = stats["lcc_node_share"]
     if lcc < 0.90:
@@ -811,25 +835,7 @@ def print_verdict(verdict, reasons, stats):
     for r in reasons:
         lines.append(f"    - {r}")
     lines.append(bar)
-    msg = "\n".join(lines)
-    LOGGER.info("Network verdict:\n%s", msg)
-    return msg
-
-
-# --------------------------------------------------------------------------- #
-# Diagonal imputation (ARSW self-commute)
-# --------------------------------------------------------------------------- #
-def diagonal_times(communes, id_col, ids, intra_speed_kmh, min_minutes):
-    """t_nn = (2/3) * sqrt(Area/pi) / v * 60, floored, area from EPSG:3035."""
-    area = dict(zip(communes[id_col].astype(str),
-                    communes.geometry.area.to_numpy()))  # m^2
-    out = np.empty(len(ids))
-    for i, cid in enumerate(ids):
-        a = max(area.get(cid, 0.0), 0.0)
-        r_km = math.sqrt(a / math.pi) / 1000.0
-        t = (2.0 / 3.0) * r_km / max(intra_speed_kmh, 1.0) * 60.0
-        out[i] = max(t, min_minutes)
-    return out
+    LOGGER.info("Network verdict:\n%s", "\n".join(lines))
 
 
 # --------------------------------------------------------------------------- #
@@ -853,23 +859,21 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "ttm_road_<centroid>_<network>.npz).")
     p.add_argument("--centroid-type",
                    choices=["unweighted", "pop-weighted", "best-pop", "multiple"],
-                   default="pop-weighted",
-                   help="Origin/destination point per commune.")
+                   default="pop-weighted", help="Origin/destination point per commune.")
     p.add_argument("--n-centroids", type=int, default=3,
                    help="For --centroid-type multiple: max candidates per commune.")
     p.add_argument("--workers", type=int, default=os.cpu_count() or 4)
     p.add_argument("--speed-profile", type=Path, default=None,
                    help="JSON override for class defaults {class:[rural,urban]}.")
     p.add_argument("--speed-factor", type=float, default=1.0,
-                   help="Multiplier on CLASS-DEFAULT speeds only (not on explicit "
+                   help="Multiplier on CLASS-DEFAULT speeds only (not explicit "
                         "maxspeed). <1 approximates realistic average speeds.")
     p.add_argument("--builtup-detection", choices=["none", "osm", "grid"],
                    default="osm",
-                   help="How to split rural vs built-up defaults where maxspeed "
-                        "is missing on ambiguous classes.")
+                   help="Split rural vs built-up defaults where maxspeed is "
+                        "missing on ambiguous classes.")
     p.add_argument("--population-grid", type=Path, default=DEFAULT_POP_GRID,
-                   help="100 m population parquet (lon/lat/population) for "
-                        "--builtup-detection grid.")
+                   help="100 m population parquet (lon/lat/population) for grid mode.")
     p.add_argument("--builtup-pop-threshold", type=float, default=25.0,
                    help="Persons per 100 m cell to count a cell as built-up.")
     p.add_argument("--intra-speed", type=float, default=30.0,
@@ -883,39 +887,33 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Reference total drivable km for the completeness check.")
     p.add_argument("--strict", action="store_true",
                    help="Exit non-zero if the verdict is BAD.")
-    p.add_argument("--no-csv", action="store_true",
-                   help="Write only the NPZ, skip the wide CSV.")
+    p.add_argument("--no-csv", action="store_true", help="Write only the NPZ.")
     p.add_argument("--tmp-dir", type=Path, default=None,
                    help="Local scratch dir (needed when --output is on NFS).")
     p.add_argument("--log-file", type=Path, default=None)
     return p.parse_args(argv)
 
 
-def setup_logging(log_file: Path | None) -> None:
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+def setup_logging(log_file):
+    handlers = [logging.StreamHandler(sys.stderr)]
     if log_file is not None:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         handlers.append(logging.FileHandler(log_file))
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)-7s | %(message)s",
-        datefmt="%H:%M:%S",
-        handlers=handlers,
-    )
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s | %(levelname)-7s | %(message)s",
+                        datefmt="%H:%M:%S", handlers=handlers)
 
 
-def load_speed_profile(path: Path | None) -> dict[str, tuple[float, float]]:
+def load_speed_profile(path):
     prof = {k: tuple(v) for k, v in DEFAULT_SPEED_PROFILE.items()}
     if path is not None:
         with open(path) as fh:
-            override = json.load(fh)
-        for k, v in override.items():
-            prof[k] = (float(v[0]), float(v[1]))
+            for k, v in json.load(fh).items():
+                prof[k] = (float(v[0]), float(v[1]))
     return prof
 
 
-def build_pop_tree(pop_grid_path: Path, threshold: float, transformer):
-    """cKDTree over populated 100 m cell centres in EPSG:3035."""
+def build_pop_tree(pop_grid_path, threshold, transformer):
     from scipy.spatial import cKDTree
     LOGGER.info("Loading population grid for built-up detection: %s", pop_grid_path)
     df = pd.read_parquet(pop_grid_path, columns=["lon", "lat", "population"])
@@ -948,9 +946,8 @@ def main(argv=None) -> int:
     ambig = ambiguous_classes(profile)
     to_metric = Transformer.from_crs(CRS_WGS84, CRS_METRIC, always_xy=True)
 
-    # Built-up population tree (optional).
     pop_tree = None
-    cellsize = 100.0  # half-diagonal ~71 m; nearest-cell within ~100 m ~ inside
+    cellsize = 100.0
     if args.builtup_detection == "grid":
         if not args.population_grid.exists():
             LOGGER.error("--builtup-detection grid needs --population-grid: %s",
@@ -959,7 +956,6 @@ def main(argv=None) -> int:
         pop_tree = build_pop_tree(args.population_grid, args.builtup_pop_threshold,
                                   to_metric)
 
-    # 1. Parse + build graph.
     ways = parse_pbf_ways(args.network)
     if not ways:
         LOGGER.error("No drivable ways parsed -- is this a road-filtered PBF?")
@@ -968,33 +964,32 @@ def main(argv=None) -> int:
                     pop_tree, cellsize, ambig, to_metric)
     del ways
     LOGGER.info("Graph: %s nodes, %s directed edges",
-                f"{G['n_nodes']:,}", f"{len(G['edges']):,}")
+                f"{G['n_nodes']:,}", f"{len(G['eu']):,}")
 
     total_km = sum(G["class_len"].values()) / 1000.0
-    major = ["motorway", "trunk", "primary", "secondary", "tertiary"]
+    major = ("motorway", "trunk", "primary", "secondary", "tertiary")
     major_len = sum(G["class_len"].get(c, 0.0) for c in major)
     major_exp = sum(G["class_len_explicit"].get(c, 0.0) for c in major)
     all_len = sum(G["class_len"].values())
     all_exp = sum(G["class_len_explicit"].values())
 
-    # 2. Giant SCC + contraction.
-    members, sub_edges, scc_sizes = giant_scc(G["n_nodes"], G["edges"])
+    members, su, sv, sl, st, sc, _counts = giant_scc(
+        G["n_nodes"], G["eu"], G["ev"], G["el"], G["et"], G["ec"])
     lcc_share = len(members) / max(G["n_nodes"], 1)
     LOGGER.info("Giant SCC: %s / %s nodes (%.1f%%)",
                 f"{len(members):,}", f"{G['n_nodes']:,}", 100 * lcc_share)
-
-    # Reindex SCC nodes to 0..len(members)-1.
-    old2scc = {old: i for i, old in enumerate(members.tolist())}
-    scc_edges = [(old2scc[u], old2scc[v], l, t) for (u, v, l, t) in sub_edges]
     scc_xy = G["node_xy"][members]
+    # Full-graph edge arrays are no longer needed; free them before contraction.
+    for _k in ("eu", "ev", "el", "et", "ec", "node_xy"):
+        G[_k] = None
 
-    # 3. Select + snap centroids (to full-resolution SCC nodes) BEFORE contraction.
+    # Read communes + candidates.
     communes = gpd.read_file(args.communes, layer=args.communes_layer)
-    if str(communes.crs) not in (CRS_METRIC, "epsg:3035", "EPSG:3035"):
+    if str(communes.crs).upper() != CRS_METRIC:
         communes = communes.to_crs(CRS_METRIC)
     try:
         candidates = gpd.read_file(args.communes, layer=args.candidates_layer)
-        if str(candidates.crs) != CRS_METRIC:
+        if str(candidates.crs).upper() != CRS_METRIC:
             candidates = candidates.to_crs(CRS_METRIC)
     except Exception:
         candidates = None
@@ -1002,68 +997,57 @@ def main(argv=None) -> int:
     ids, per_points = select_points(communes, candidates, args.id_col,
                                     args.centroid_type, args.n_centroids)
 
+    # Snap every distinct point to the nearest full-resolution SCC node.
     scc_tree = cKDTree(scc_xy)
-    # Snap every distinct point; protect the snapped SCC nodes.
-    point_keys: list[tuple[str, int]] = []
-    pxy: list[tuple[float, float]] = []
+    point_keys, pxy = [], []
     for cid in ids:
         for k, (x, y, _w) in enumerate(per_points[cid]):
             point_keys.append((cid, k))
             pxy.append((x, y))
     pxy = np.asarray(pxy)
     snap_dist, snap_scc = scc_tree.query(pxy, k=1)
-    protected_scc = set(int(s) for s in snap_scc)
     LOGGER.info("Snapped %d points | median %.0f m | p95 %.0f m | max %.0f m",
-                len(pxy), np.median(snap_dist),
-                np.percentile(snap_dist, 95), snap_dist.max())
+                len(pxy), np.median(snap_dist), np.percentile(snap_dist, 95),
+                snap_dist.max())
 
-    # Contract.
+    # Contract (protecting snapped nodes so they survive).
     if args.no_simplify:
         n_core = len(members)
-        core_edges = scc_edges
-        scc2core = {i: i for i in range(len(members))}
+        ru = su.astype(np.int32); rv = sv.astype(np.int32)
+        rl = sl.astype(np.float64); rt = st.astype(np.float64); rc = sc.astype(np.float64)
+        scc2core = np.arange(len(members), dtype=np.int64)
     else:
-        n_core, core_edges, scc2core = simplify_graph(
-            len(members), scc_edges, protected_scc)
+        protected = np.zeros(len(members), bool)
+        protected[np.unique(snap_scc.astype(np.int64))] = True
+        n_core, (ru, rv, rl, rt, rc), scc2core = simplify_graph(
+            len(members), su, sv, sl, st, sc, protected)
         LOGGER.info("Contraction: %s -> %s nodes, %s -> %s directed edges",
                     f"{len(members):,}", f"{n_core:,}",
-                    f"{len(scc_edges):,}", f"{len(core_edges):,}")
+                    f"{len(su):,}", f"{len(ru):,}")
 
-    graph = build_igraph(n_core, core_edges)
+    graph = build_igraph(n_core, ru, rv, rl, rt, rc)
 
-    # Map each snapped point to its core node index.
-    snap_node_core: dict[tuple[str, int], int] = {}
-    for key, s in zip(point_keys, snap_scc):
-        snap_node_core[key] = scc2core[int(s)]
+    snap_core = scc2core[snap_scc.astype(np.int64)]
+    snap_node = {key: int(nd) for key, nd in zip(point_keys, snap_core)}
+    unique_nodes = sorted(set(snap_node.values()))
+    node_pos = {nd: i for i, nd in enumerate(unique_nodes)}
+    snap_pos = {key: node_pos[nd] for key, nd in snap_node.items()}
 
-    # Unique routing nodes.
-    unique_nodes = sorted(set(snap_node_core.values()))
-    node_to_pos = {nd: i for i, nd in enumerate(unique_nodes)}
-    snap_pos = {key: node_to_pos[nd] for key, nd in snap_node_core.items()}
-
-    # 4. Route unique x unique.
-    D_sec = route_matrix(graph, unique_nodes, unique_nodes,
-                         workers=args.workers, tmp_dir=args.tmp_dir)
+    D_sec = route_matrix(graph, unique_nodes, args.workers, args.tmp_dir)
     unreachable = int(np.isinf(D_sec).sum())
     if unreachable:
-        LOGGER.warning("%d unreachable node pairs (unexpected within an SCC)",
-                       unreachable)
+        LOGGER.warning("%d unreachable node pairs (unexpected within an SCC)", unreachable)
         D_sec = np.where(np.isinf(D_sec), np.nan, D_sec)
 
-    # 5. Aggregate to commune x commune (minutes) + diagonal.
-    T = aggregate(ids, per_points, snap_pos, unique_nodes, D_sec)
-    diag = diagonal_times(communes, args.id_col, ids,
-                          args.intra_speed, args.min_diagonal_min)
+    T = aggregate(ids, per_points, snap_pos, len(unique_nodes), D_sec)
+    diag = diagonal_times(communes, args.id_col, ids, args.intra_speed,
+                          args.min_diagonal_min)
     np.fill_diagonal(T, diag)
 
-    # Verdict.
     stats = {
-        "n_nodes_raw": G["n_nodes"],
-        "n_nodes_scc": len(members),
-        "n_nodes_core": n_core,
-        "n_edges_core": len(core_edges),
-        "lcc_node_share": lcc_share,
-        "total_km": total_km,
+        "n_nodes_raw": G["n_nodes"], "n_nodes_scc": len(members),
+        "n_nodes_core": n_core, "n_edges_core": len(ru),
+        "lcc_node_share": lcc_share, "total_km": total_km,
         "maxspeed_cov_all": (all_exp / all_len) if all_len else 0.0,
         "maxspeed_cov_major": (major_exp / major_len) if major_len else 0.0,
         "ambiguous_km": G["ambiguous_len"] / 1000.0,
@@ -1073,31 +1057,25 @@ def main(argv=None) -> int:
         "unreachable_pairs": unreachable,
     }
     verdict, reasons = network_verdict(stats, snap_dist, args)
-    verdict_msg = print_verdict(verdict, reasons, stats)
+    print_verdict(verdict, reasons, stats)
 
-    # 6. Write outputs.
+    # Write outputs.
     net_stem = args.network.name.replace(".osm.pbf", "").replace(".pbf", "")
-    tag = {"unweighted": "unw", "pop-weighted": "popw",
-           "best-pop": "bestpop",
+    tag = {"unweighted": "unw", "pop-weighted": "popw", "best-pop": "bestpop",
            "multiple": f"mult{args.n_centroids}"}[args.centroid_type]
     output = args.output or (DEFAULT_OUTPUT_DIR / f"ttm_road_{tag}_{net_stem}.npz")
     output.parent.mkdir(parents=True, exist_ok=True)
 
     meta = {
-        "network": str(args.network),
-        "communes": str(args.communes),
+        "network": str(args.network), "communes": str(args.communes),
         "centroid_type": args.centroid_type,
         "n_centroids": args.n_centroids if args.centroid_type == "multiple" else 1,
-        "speed_factor": args.speed_factor,
-        "builtup_detection": args.builtup_detection,
-        "units": "minutes",
-        "verdict": verdict,
-        "verdict_reasons": reasons,
+        "speed_factor": args.speed_factor, "builtup_detection": args.builtup_detection,
+        "units": "minutes", "verdict": verdict, "verdict_reasons": reasons,
         "stats": {k: (float(v) if isinstance(v, (int, float, np.floating)) else v)
                   for k, v in stats.items()},
         "class_km": {k: v / 1000.0 for k, v in sorted(G["class_len"].items())},
     }
-
     ids_arr = np.asarray(ids)
     T32 = T.astype(np.float32)
 
@@ -1105,12 +1083,10 @@ def main(argv=None) -> int:
                                     dir=str(args.tmp_dir) if args.tmp_dir else None))
     try:
         tmp_npz = scratch / output.name
-        np.savez_compressed(tmp_npz, matrix=T32, ids=ids_arr,
-                            meta=json.dumps(meta))
+        np.savez_compressed(tmp_npz, matrix=T32, ids=ids_arr, meta=json.dumps(meta))
         if output.exists():
             output.unlink()
         shutil.move(str(tmp_npz), str(output))
-
         if not args.no_csv:
             csv_path = output.with_suffix(".csv")
             tmp_csv = scratch / csv_path.name
@@ -1118,21 +1094,16 @@ def main(argv=None) -> int:
             if csv_path.exists():
                 csv_path.unlink()
             shutil.move(str(tmp_csv), str(csv_path))
-
-        meta_path = output.with_suffix(".meta.json")
-        with open(meta_path, "w") as fh:
+        with open(output.with_suffix(".meta.json"), "w") as fh:
             json.dump(meta, fh, indent=2)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
     finite = T[np.isfinite(T)]
     LOGGER.info(
-        "Done: %d x %d matrix | mean %.1f min | median %.1f min | max %.1f min "
-        "| %.1fs total.",
-        len(ids), len(ids),
-        float(np.nanmean(finite)), float(np.nanmedian(finite)),
-        float(np.nanmax(finite)), time.time() - t_start,
-    )
+        "Done: %d x %d | mean %.1f | median %.1f | max %.1f min | %.1fs total.",
+        len(ids), len(ids), float(np.nanmean(finite)), float(np.nanmedian(finite)),
+        float(np.nanmax(finite)), time.time() - t_start)
     LOGGER.info("Wrote: %s", output)
     print(str(output))
 

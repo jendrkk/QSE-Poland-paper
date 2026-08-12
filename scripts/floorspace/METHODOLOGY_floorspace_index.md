@@ -1,225 +1,144 @@
 # A Static (2021) Gmina-Level Hedonic Residential Floorspace Price Index for Poland
 
-**Purpose.** Produce one quality-adjusted price of 1 m² of residential *living space* for every 2021 gmina (≈2,477 units), with a single, comparable interpretation across urban, rural, and urban–rural gminas, for calibrating an MRRH-type quantitative spatial model. The index pools **all** floorspace-bearing RCN transaction microdata (flats + houses), corrects and disaggregates it with official GUS powiat-level transaction prices, and reflects the 2021 price level.
+**Purpose.** One quality-adjusted price of 1 m² of residential *living space* for every 2021 gmina (≈2,477), with a single interpretation across urban, rural, and urban–rural gminas, for calibrating an MRRH-type quantitative spatial model. The index pools **all** floorspace-bearing transaction microdata — flats (`lokale`) and houses (via BDOT10k-estimated usable area) — nets out plot-land value so it measures enclosed living space, disaggregates and corrects it with official GUS powiat prices, and reflects the 2021 price level.
 
-This document specifies exactly which information is drawn from each input file, the cleaning rules, the spatial assignment, the econometric model, and the output. It is the design contract for the code in `scripts/floorspace/`.
+This document is the design contract for the code in `scripts/floorspace/`. **v2** adds: BDOT10k-based house usable area (13× more house observations), a marginal rural-house route via parcels, explicit plot-land netting, and an explicit market covariate.
 
 ---
 
-## 0. Summary of the empirical situation (why the design is what it is)
+## 0. Empirical situation (why the design is what it is)
 
-Findings from a full profiling of the three RCN GeoPackages, the two GUS files, the TERYT tables, and `communes_2021.gpkg`:
+1. **`teryt` in RCN is a 4-digit *powiat* code** across all layers. Gmina must come from a **spatial join** of the transaction geometry (100 % present, EPSG:2180) to 2021 gmina polygons.
 
-1. **`teryt` in RCN is a 4-digit *powiat* code** (uniform across all three layers, 371–379 distinct powiats). It does **not** encode gmina. Gmina must come from a **spatial join** of the transaction geometry to gmina polygons. Geometry is present on 100 % of rows, valid, in **EPSG:2180**.
+2. **The RCN layers are one transaction decomposed**, linked by `tran_lokalny_id_iip` (66 % of `budynki` and 37 % of `dzialki` transactions also appear in `lokale`). Deduplication is therefore always by **transaction id**, never by building/parcel.
 
-2. **The three layers are one transaction decomposed**, linked by `tran_lokalny_id_iip` (66 % of `budynki` and 37 % of `dzialki` transactions also appear in `lokale`). This creates double-counting risk that the pipeline resolves by defining a single unit of observation per layer role.
+3. **GUS `P3787`/`P3788` are the officially-cleaned powiat aggregates of the same RCN registry, restricted to flats** (`lokale mieszkalne`; single-family houses excluded). Our cleaned RCN `lokale` 2021 powiat medians reproduce GUS median at **corr 0.982, ratio 1.005**. GUS is thus a concept-matched anchor for the *flat* level and a validation gate; the house level is tied to flats through the hedonic property-type differential.
 
-3. **Only two layers carry usable floor area:**
-   - `lokale` (flat sales, POINT): `lok_pow_uzyt` present on **99.8 %** of the 2.13 M residential rows. This is the workhorse (~1.46 M clean arm's-length flats).
-   - `budynki` (building polygons): usable floor area `bud_pow_uzyt` exists for only **7 % of built-up residential house sales** (~50–97 k nationally). This is the *only* source of genuine house floorspace prices; it is scarce but essential for rural coverage.
-   - `dzialki` (land parcels) has **no building floor area at all** → it cannot price floorspace directly. It is used for (a) *land-price* covariates that help predict thin gminas and (b) built-up/undeveloped classification.
+4. **BDOT10k enrichment unlocks house floorspace.** `budynki_bdot10k.gpkg` adds, per building, a footprint (from geometry), a BDOT10k floor count, and `usable_area_est_m2 = footprint × floors × ~0.73` (usable/gross factor). For built-up residential house sales this raises usable-area coverage from **19 % → 98 %**, i.e. **~50 k → ~456 k** clean arm's-length house transactions (overlap-matched). This is the single biggest improvement to rural coverage.
 
-4. **GUS `P3787`/`P3788` are the officially-cleaned powiat aggregates of the *same* RCN registry, restricted to `lokale mieszkalne` (flats in multi-dwelling buildings; single-family houses excluded).** Proof: our cleaned RCN `lokale` 2021 powiat medians reproduce GUS median almost exactly — **corr = 0.982**, median ratio **RCN/GUS = 1.005** (p10 0.98, p90 1.08) over 162 common powiats. Consequences:
-   - GUS is a **concept-matched anchor for the flat component**; the house component is tied in through a hedonic property-type differential.
-   - GUS is not independent of RCN flats (same source), but it still adds value: official stratified cleaning, complete powiat/year coverage, an external validated *level*, and a clean temporal path. We therefore use it as the **prior mean / auxiliary covariate** in a small-area model rather than as independent evidence.
-   - The near-perfect reproduction is a **built-in validation gate** for the cleaning pipeline.
+5. **Concentration, not raw quality, is the binding constraint.** Top-10 powiats hold 43 % of flat sales; 65 powiats have < 200. Houses + hierarchical shrinkage to GUS fill the rural gap.
 
-5. **Concentration, not raw quality, is the binding constraint.** Top-10 powiats hold 43 % of flat transactions; the bottom 50 % of powiats hold 4.5 %; 65 powiats have < 200 flat sales. At gmina resolution many rural gminas have few or zero flat sales. This is why (a) houses/land are pooled in and (b) a hierarchical shrinkage-to-GUS estimator is used.
-
-6. **Data-quality problems are material and must be filtered** (magnitudes on the clean flat subset, all years, n≈1.71 M): ~5.3 % zero/negative unit prices (developer records with the price only in the bundle field), ~7 % below 1,000 zł/m², extreme upper outliers (area mis-entry → price/m² in the millions; mean 19,960 vs p99.9 34,891), ~921 k NULL ownership shares plus explicit fractional-share deals, corrupted dates (year 0006–9200), and ~106 k duplicate groups.
+6. **Self-constructed data must be audited** (see §4B). The BDOT10k join has a `match_type` in {overlap 90 %, nearest 8 %, unmatched 2 %}; `nearest` matches systematically grab small outbuildings (median footprint 24 m²) and are excluded. BDOT floor counts show artefact spikes (5, 11) and tall "houses" (whole apartment blocks); floors are capped. Parcel areas in `dzialki` are ~9 % ha-coded — geometry area is used instead.
 
 ---
 
 ## 1. Inputs and exactly what is taken from each
 
-All paths are relative to the repository root `QSE_Poland_paper/`.
+### 1.1 `lokale.gpkg` — flats (primary)
+POINT, EPSG:2180, 2.59 M rows. Both markets are kept (market is a covariate, not a filter). Fields: `geom` (→ gmina), `lok_funkcja='mieszkalna'`, `lok_pow_uzyt` (area), price cascade `lok→nier→tran` (tran only when single-unit), `lok_liczba_izb` (rooms), `lok_nr_kond` (flat storey), `tran_rodzaj_rynku` (→ market ∈ {primary, secondary, unknown}), `tran_rodzaj_trans='wolnyRynek'`, `nier_udzial` (1/1 or NULL-single), `dok_data` (year), `tran_lokalny_id_iip`/`lok_id_lokalu` (dedup), `teryt` (powiat cross-check).
 
-### 1.1 `data/raw/floorspace/lokale.gpkg` — flats (primary)
-POINT geometry, EPSG:2180, 2,593,413 rows. Fields used:
+### 1.2 `budynki_bdot10k.gpkg` — houses (PRIMARY, v2)
+MULTIPOLYGON, EPSG:2180, 6.23 M rows = original `budynki` + BDOT10k columns. We keep **whole-house sales**: `nier_rodzaj='nieruchomoscGruntowaZabudowana'`, `is_residential=1`, `match_type='overlap'`, `match_overlap_frac ≥ 0.30`, `usable_area_est_m2` present, `bdot_floors ∈ [1,5]`, `tran_rodzaj_trans='wolnyRynek'`, full ownership. Per **transaction** (`tran_lokalny_id_iip`): usable area = Σ residential-building `usable_area_est_m2`; building floors = max; plot = `nier_pow_gruntu` (ha-corrected against footprint); price = property price (`nier`, else single-unit `tran`); representative point = centroid of the largest building.
 
-| Field | Use |
-|---|---|
-| `geom` (POINT) | gmina assignment via spatial join |
-| `lok_funkcja` | keep `mieszkalna`; drop `garaz`, `inne`, `handlowoUslugowa`, `biurowa`, `produkcyjna` |
-| `lok_pow_uzyt` | floor area (m²) — denominator of price/m² and hedonic size regressor |
-| `lok_cena_brutto` → `nier_cena_brutto` → `tran_cena_brutto` | unit price by **coalescing cascade**; `tran` only used when the transaction is single-unit (see §2.2) |
-| `lok_liczba_izb` | rooms (structural control) |
-| `lok_nr_kond` | storey/floor (structural control; negatives = basement) |
-| `tran_rodzaj_rynku` | primary/secondary market dummy (`pierwotny`/`wtorny`) |
-| `tran_rodzaj_trans` | keep `wolnyRynek` only |
-| `tran_sprzedajacy` | flag/exclude public sellers (`jednostkaSamorzaduTerytorialnego`, `skarbPanstwa`) as robustness |
-| `nier_udzial` | ownership share; keep `1/1` (or NULL when single-unit); drop fractions |
-| `dok_data` | transaction year → year FE; date-sanity filter |
-| `tran_lokalny_id_iip`, `lok_id_lokalu` | transaction/unit identity → dedup and single-unit detection |
-| `teryt` | powiat code → cross-check against geometry-derived powiat |
+### 1.3 `dzialki.gpkg` — land + marginal houses
+MULTIPOLYGON, EPSG:2180, 9.87 M rows; four `nier_rodzaj` kinds (lokalowa, gruntowaZabudowana, gruntowaNiezabudowana, budynkowa). Used for:
+- **Undeveloped residential-land price surface**: `gruntowaNiezabudowana` with residential zoning (`dzi_przezn_wmpzp LIKE %budownictwoMieszkaniowe%`) or `dzi_sposob_uzyt='gruntyZabudowaneIZurbanizowane'`, arm's-length, price `nier→dzi`, area from **polygon geometry** (m², avoids the ~9 % ha errors in `dzi_pow_ewid`).
+- **Marginal rural house transactions**: `gruntowaZabudowana` priced sales **not already in the budynki house set**, joined to the building bridge for usable area; plot area from the parcel polygon.
 
-### 1.2 `data/raw/floorspace/budynki.gpkg` — houses (rural extension)
-MULTIPOLYGON, EPSG:2180, 6,233,436 rows. We keep **only genuine whole-house sales with floor area**:
-`nier_rodzaj = 'nieruchomoscGruntowaZabudowana'` (house on its plot) **and** `bud_rodzaj = 'mieszkalny'` **and** `bud_pow_uzyt` non-null (~97 k rows; ~50 k after quality filters). Fields:
+### 1.4 `budynki_dzialki_bdot10k.gpkg` — building↔parcel bridge (v2)
+POLYGON, 1.41 M rows: BDOT10k buildings mapped to parcels, with `dzi_id_dzialki`, `dzi_tran_lokalny_id_iip`, `usable_area_est_m2`, `is_residential`, `bdot_floors`. Provides residential usable area per parcel (summed across multiple buildings — 40 % of built-up parcels have >1 building) for the marginal route. 91 % of its buildings are shared with `budynki_bdot10k` (same BDOT register) — hence the transaction-id deduplication.
 
-| Field | Use |
-|---|---|
-| `geom` (polygon) → representative point | gmina assignment |
-| `bud_pow_uzyt` | house usable floor area (m²) |
-| `bud_cena_brutto` → `nier_cena_brutto` → `tran_cena_brutto` | price cascade (single-unit rule) |
-| `bud_rodzaj`, `nier_rodzaj` | residential/house filter |
-| `tran_rodzaj_trans`, `tran_rodzaj_rynku`, `nier_udzial`, `tran_sprzedajacy`, `dok_data`, `tran_lokalny_id_iip` | same roles as in `lokale` |
-| `nier_pow_gruntu` | plot area (house-specific control; captures land component) |
+### 1.5 GUS `P3787` (median) / `P3788` (mean)
+Powiat × market × size-class × year (2010–2024). Anchor = `median, total, ogółem, 2021`; mean and size/market cells are auxiliary/validation. Zeros = suppression → NaN. Code powiat = first 4 digits.
 
-Rows with `nier_rodzaj = 'nieruchomoscLokalowa'` in `budynki` are the building footprints of flat sales already represented in `lokale` and are **discarded** (double-counting).
-
-### 1.3 `data/raw/floorspace/dzialki.gpkg` — land (covariates only)
-MULTIPOLYGON, EPSG:2180, 9,868,027 rows. **Not** a floorspace source. We derive gmina-level **auxiliary covariates**:
-
-- **Residential land price**: from `nier_rodzaj = 'nieruchomoscGruntowaNiezabudowana'` (undeveloped) with `dzi_przezn_wmpzp`/`dzi_sposob_uzyt` indicating residential zoning (`budownictwoMieszkanioweJedno/Wielorodzinne`, `gruntyZabudowaneIZurbanizowane`), `tran_rodzaj_trans='wolnyRynek'`, price `nier_cena_brutto`/`dzi_cena_brutto` over `dzi_pow_ewid` (100 % populated). Aggregate to a robust gmina **median land zł/m²**.
-- **Built-up share / transaction intensity**: counts of built-up vs undeveloped residential parcels per gmina (a development-pressure proxy).
-
-These feed the small-area model as predictors of the gmina price level, materially helping gminas with few/zero house or flat sales (land transactions are far more numerous in rural areas).
-
-### 1.4 `data/raw/floorspace/GUS_P3787_median_…csv` and `GUS_P3788_mean_…csv`
-Semicolon-delimited BDL exports, UTF-8, 397 data rows (POLSKA + 16 voivodeships + ~380 powiats), header dimensioned **market × size-class × year**:
-- market ∈ {`ogółem`, `rynek pierwotny`, `rynek wtórny`}
-- size ∈ {`ogółem`, `do 40 m2`, `od 40,1 do 60 m2`, `od 60,1 do 80 m2`, `od 80,1 m2`}
-- year ∈ {2010,…,2024}
-- code `WWPPGGG` with `GGG=000` for powiat aggregates (powiat = first four digits, matches RCN `teryt`).
-
-**Zeros are suppression → treated as missing.** We extract:
-- **Anchor**: `median, ogółem, ogółem, 2021` per powiat (primary); `mean, …, 2021` as robustness/auxiliary.
-- **Composition**: primary/secondary and size-class 2021 values (to sanity-check the hedonic market and size coefficients).
-- **Temporal series 2010–2024** per powiat: used to (a) validate the national hedonic year FE against official local price paths and (b) optionally deflate under the alternative temporal scheme.
-
-### 1.5 `data/processed/shapefiles/communes_2021.gpkg`
-2,477 gmina polygons, **EPSG:3035**, key fields `JPT_KOD_JE` (7-digit TERYT), `pop`, `centroid`, `weighted_centroid`. This defines the target spatial units and provides population (an SAE covariate and an aggregation weight). Reprojected to EPSG:2180 for the join (reprojecting 2,477 polygons is far cheaper than millions of points).
-
-### 1.6 `data/raw/teryt/TERC_Urzedowy_2021-01-01.csv` (+ 2011 + change XML)
-`WOJ;POW;GMI;RODZ;NAZWA;…`. Provides gmina **names** and **RODZ type** (1 miejska / 2 wiejska / 3 miejsko-wiejska / 4 miasto / 5 obszar wiejski). RODZ is a structural covariate (housing-stock composition differs sharply by type) and drives the urban-flats / rural-houses logic. The 2011 table + `TERC…zmiany….xml` are used only if any historical TERYT reconciliation is required (RCN spans years with boundary changes); the 2021 vintage is authoritative for the static index.
+### 1.6 `communes_2021.gpkg` (EPSG:3035; 2,477 gminas, `JPT_KOD_JE`, `pop`) and `TERC_Urzedowy_2021` (gmina names, RODZ type). Communes are reprojected to 2180 for the join.
 
 ---
 
-## 2. Stage 1 — Micro data construction (per layer)
+## 2. Micro construction (per source)
 
-### 2.1 Numeric parsing
-All numeric fields are TEXT. Parse defensively: strip spaces, normalise decimal comma → dot, cast to float; non-parseable → NaN.
+**Parsing.** All numeric fields are TEXT; parsed defensively (space-strip, decimal-comma → dot).
 
-### 2.2 Price definition (avoids the main mechanical bias)
-Unit price = first non-null of (`{lok|bud}_cena_brutto`, `nier_cena_brutto`, `tran_cena_brutto`), **except** `tran_cena_brutto` is used only when the transaction is single-unit (`tran_lokalny_id_iip` maps to exactly one retained row). Rationale: `tran_cena_brutto` is the whole-bundle price and is repeated across all rows of a multi-item deal (e.g. flat + 2 garages), so dividing it by one unit's area over-prices. All prices are gross (brutto); primary-market gross includes VAT — absorbed by the market dummy.
+**Price.** Unit price = first non-null of the component/property/transaction fields, with the whole-transaction field used only for single-unit deals (avoids dividing a bundled price by one unit's area).
 
-### 2.3 Transaction filters (applied to `lokale` and `budynki`)
-- `tran_rodzaj_trans = 'wolnyRynek'` (drops bonifikata/tender/foreclosure/non-tender municipal sales — e.g. `sprzedazZBonifikata` are 80–95 % below market).
-- Ownership: `nier_udzial ∈ {'1/1'}` or NULL when single-unit; drop explicit fractions and malformed `'/'`.
-- Residential function/type filters (§1.1, §1.2).
-- Date sanity: `2006 ≤ year ≤ 2026` (configurable); year from `dok_data[:4]`.
-- **Deduplicate** on (`tran_lokalny_id_iip`, `lok_id_lokalu`/`bud_id_budynku`), then on (unit id, date, price).
+**Flats** (`build_flats`): filters `mieszkalna`, `wolnyRynek`, ownership; hard gates price>0, area∈[15,400], year∈[2006,2026], ppm2∈[1 000, 50 000]; dedup by (tran,unit) and (unit,date,price). Output `ppm2 = price/area`.
 
-### 2.4 Outlier trimming (two tiers)
-1. **Hard sanity gate** (domain bounds): price > 0; area ∈ [15, 400] m² for flats, [25, 1000] m² for houses; price/m² ∈ [1,000, 50,000] zł. Removes the pathological ~6–8 %.
-2. **Robust within-stratum trim**: within `powiat × property-type × market × year` strata, drop observations with |z| > 4 on log price/m² using the median/MAD (1.4826·MAD) robust scale; strata with < ~30 obs fall back to `powiat × property-type`. Removes ~1–1.5 % extreme tails without distorting central mass. Trimming thresholds are CLI-configurable.
+**Houses** (`build_houses_primary` + `build_houses_marginal`): assembled per transaction (§1.2, §1.3), deduplicated across the two routes by `tran_lokalny_id_iip` (budynki primary; dzialki adds only new ids — ~85 k marginal). Usable area is the summed residential BDOT10k estimate. `ppm2` is filled **after** land netting (§3).
 
-### 2.5 Geometry → representative point
-`lokale` are already points. For `budynki`/`dzialki` we take a **representative point on surface** (guaranteed interior) of the polygon. Points remain in EPSG:2180.
-
-Output of Stage 1: a tidy micro table `micro` with columns
-`{price, area, log_ppm2, property_type∈{flat,house}, market, rooms, floor, plot_area, year, x2180, y2180, powiat_teryt, weight}` — flats and houses stacked, plus a separate gmina-level `land` table from `dzialki`.
+**Land** (`build_land`): undeveloped residential-land points with `land_ppm2 = price / geometry_area`; gate [1, 20 000] zł/m²; ha-coded rows flagged via recorded/geometry ratio.
 
 ---
 
-## 3. Stage 2 — Spatial assignment to gmina
+## 3. Spatial assignment, land surface, and land netting
 
-1. Load `communes_2021.gpkg`, reproject 3035 → 2180.
-2. Point-in-polygon join of `micro` points to gmina polygons using a prepared-geometry STRtree, parallelised over CPU cores (joblib/loky), mirroring `commune_centroids.py`. Each transaction receives `gmina_teryt` (`JPT_KOD_JE`).
-3. **Validation gate**: geometry-derived powiat (`gmina_teryt[:4]`, mapped through TERC) must equal the record's RCN `teryt`; the mismatch rate is logged and mismatches are flagged/optionally dropped (geocoding/boundary error indicator).
-4. Aggregate the `dzialki` land table to gmina medians in the same way (representative points → gmina).
+1. **Gmina assignment.** Reproject communes 3035→2180; parallel within-join of flat/house/land points to gmina polygons; validate geometry-derived powiat against RCN `teryt`.
+2. **Local land-price surface** (`build_land_surface`): hierarchical median undeveloped-land zł/m² per gmina, filled **gmina → powiat → voivodeship → national** so every gmina has a value. This doubles as the SAE `log_land` covariate.
+3. **House land-netting** (`net_land`): the index must price *enclosed living space*, not garden/plot land, so
+   `structure_price = P_total − min(p_land_local × plot_area, cap × P_total)`, `price/m² = structure_price / usable_area`,
+   with `cap = 0.60` and plot imputed by powiat-median where missing. Methods: `subtract` (default), `regress` (keep P/usable, add log-plot as a house covariate), `none`. Post-netting gate ppm2 ∈ [500, 40 000].
 
-Result: every retained transaction has a 2021 gmina; gmina-level land covariates are attached.
+Rationale: netting the plot at local raw-land prices removes the value of the plot as land while retaining the location premium embedded in the structure — comparable to a flat's price/m², and to the GUS flat anchor after the property-type differential.
 
 ---
 
-## 4. Stage 3 — National hedonic regression (the "direct" estimator)
-
-Pooled OLS on all retained flats + houses:
+## 4. Hedonic (national, pooled flats + houses)
 
 ```
-log(price_i / area_i) = α
-      + f(log area_i)                     # size gradient (log area + quadratic)
-      + β_house · 1[house]_i              # property-type differential (ties houses to flats)
-      + β_house · (house-specific terms)  # log plot area, interacted with 1[house]
-      + β_mkt · 1[primary]_i              # market level shift
-      + β_rooms · rooms_i + β_floor · floor_i
-      + δ_t   (year fixed effects, δ_2021 ≡ 0)      # STATIC-2021 normalisation
-      + γ_g   (gmina fixed effects)                  # quality-adjusted gmina level
-      + ε_i
+log(price/m²)_i = α
+   + f(log area)                      # size gradient (log area + quadratic)
+   + β_house·1[house]                 # property-type level (ties houses to flats)
+   + β_prim·1[primary] + β_unk·1[unknown]     # explicit market covariate (secondary = ref)
+   + rooms (+miss)                    # flats
+   + storey (+miss)                   # flat storey
+   + bld_floors (+miss)               # BDOT10k building floors (houses)
+   [+ log_plot_house  if netting='regress']
+   + δ_t (year FE, δ_2021 ≡ 0)        # STATIC-2021 normalisation (all reference-year cells dropped)
+   + γ_g (gmina FE)                   # quality-adjusted gmina level = direct estimate θ̂_g
+   + ε_i
 ```
-
-- **Identification of the static 2021 index.** Year FE with the 2021 reference make `γ_g` a time-invariant, quality-adjusted gmina price level expressed at 2021. Pooling all years with a common national `δ_t` imposes that *relative* cross-gmina prices are time-stable and price growth is proportional nationwide. This is the baseline the user selected ("first with hedonic year FE, use all data"). Robustness knobs relax it: `--time-fe {year, woj_year}` (voivodeship×year trends) and `--year-min/--year-max` (window restriction, e.g. 2016–2024).
-- **Estimation.** High-dimensional two-way FE (≈2,477 gmina + ≤21 year dummies + ~10 controls) solved as a sparse linear system: build the sparse design `X` (scipy.sparse), form the normal equations `XᵀX` (dense ≈2,510², trivially invertible) with a tiny ridge for numerical stability, solve for (β, γ, δ). This is exact, dependency-light, and multicore via BLAS. No `pyfixest`/`lfe` dependency required.
-- **Direct estimate per gmina.** `θ̂_g = α + γ_g + β·x̄_ref` = log price/m² of a reference (sample-mean-characteristics) dwelling in gmina g at 2021, with sampling variance `D_g` from the FE block of `σ̂²(XᵀX)⁻¹` (heteroskedasticity-robust; optionally clustered by gmina). Gminas with **zero** retained transactions have no `θ̂_g` (handled in Stage 4). The overall level (α) is only pinned in Stage 4 by GUS, so the arbitrary reference-composition choice is immaterial.
-- **Diagnostics.** R², coefficient signs/magnitudes (expect concave size gradient, primary > secondary by ~10–15 %, house < flat per m²), and comparison of the estimated `δ_t` path to the GUS POLSKA 2010–2024 series.
+Controls are centred, so `γ_g` = expected log(price/m²) of a mean-characteristics dwelling in gmina g at 2021, with HC1 sampling variance `D_g`. Solved as a sparse two-way FE normal-equations system (no external FE library). Options: `--time-fe {year, woj_year}`, `--year-min/--year-max`. Diagnostics compare the δ_t path to the GUS national series.
 
 ---
 
-## 5. Stage 4 — Small-area model: hierarchical shrinkage to the GUS prior
+## 4B. Data-quality audit — self-constructed BDOT10k / parcel data
 
-This is where sparse gminas are corrected with GUS and where zero-data gminas get an imputed value. It is a **two-level Fay–Herriot area-level model** (gmina nested in powiat), i.e. parametric empirical/hierarchical Bayes — matching the requested "hierarchical Bayesian prior."
+Because usable area and parcel area are self-constructed, filters are applied **before** use and their attrition is logged (each builder reports rows in/out):
 
-**Area model** (one observation per gmina g in powiat p):
-```
-θ̂_g = θ_g + e_g,              e_g ~ N(0, D_g)        # sampling error, D_g from Stage 3
-θ_g = xᵀ_g η + u_p + v_g,      u_p ~ N(0, τ²), v_g ~ N(0, A)
-```
-with area covariates `x_g`:
-- `log GUS_median_powiat,2021` (the dominant predictor; coefficient ≈ 1 expected),
-- RODZ gmina type (urban/rural/urban–rural),
-- `log gmina residential land price` (from `dzialki`),
-- log population / population density (`communes_2021`),
-- gmina flat-share of transactions (composition control linking the flats-only GUS to the unified target).
+- **Match reliability**: keep `match_type='overlap'` (drop `nearest`: outbuildings, median footprint 24 m², 2.2× inflated price/m²); require `match_overlap_frac ≥ 0.30`.
+- **Floors**: `bdot_floors ∈ [1,5]` — excludes the artefact spikes (5, 11 are BDOT default-fills that mostly vanish under the overlap filter) and tall buildings (≥6 → whole apartment blocks / mismatches, price/m² jumps to ~16 000).
+- **Usable area**: ∈ [25, 1000] m²; robust within-stratum MAD trim on log price/m².
+- **Parcel/plot area**: use **polygon geometry** (m²), not `dzi_pow_ewid`/`nier_pow_gruntu` (~9–13 % ha-coded); a plot smaller than its own footprint is ha-corrected (×10 000); land ratio flag drops residual ha rows.
+- **Land netting guards**: land value capped at 60 % of price; post-netting price/m² bounds; source down-weighting (`qweight`: overlap-frac for primary houses, 0.7 for marginal).
 
-**Behaviour by data richness:**
-- Data-rich gmina (small `D_g`): posterior ≈ direct estimate `θ̂_g`.
-- Thin gmina (large `D_g`): posterior shrinks toward the model mean `xᵀ_g η + u_p`, i.e. toward the **GUS powiat level** adjusted for the gmina's type/land/population.
-- **Zero-data gmina**: `θ̃_g = xᵀ_g η + û_p` — a pure prediction from GUS + covariates. Every one of the 2,477 gminas therefore receives a defined value with an uncertainty band.
-
-**Estimation.** Default: empirical Bayes — variance components (τ², A) by REML (Fisher scoring / EM), then BLUP/posterior means and MSE (Prasad–Rao). This needs only numpy/scipy and runs in seconds on 2,477 areas. Optional `--bayes` flag: full MCMC (numpyro/NUTS) on the same area model for exact posterior credible intervals (cheap at area level), behind a guarded import.
-
-**GUS mean vs median.** Median GUS is the primary anchor (robust, matches the robust hedonic). GUS mean enters as an additional covariate / robustness anchor; the size-class and primary/secondary GUS cells validate the hedonic composition coefficients.
-
-**Optional exact powiat benchmarking** (`--benchmark-to-gus`): after shrinkage, multiplicatively rescale gmina levels within each powiat so that the transaction- (or population-) weighted mean of gmina indices equals the GUS powiat 2021 value exactly. This enforces hard consistency with the official statistic on top of the soft Bayesian pull; off by default (the Bayesian anchor already ties levels), available for calibration coherence.
+The audit is not optional cosmetics: it is what makes the 456 k + 85 k self-constructed house observations trustworthy without being over-conservative (the overlap+floors gates retain ~0.5 M of ~0.66 M candidate house transactions).
 
 ---
 
-## 6. Stage 5 — Output
+## 5. Small-area model — hierarchical shrinkage to the GUS prior
 
-- `index_g = exp(θ̃_g)` — **zł per m² of residential living space, 2021, quality-adjusted**, for all 2,477 gminas, with posterior SD / credible interval.
-- Companion columns: number of retained flat and house transactions, effective sample, shrinkage weight `A/(A+D_g)` (transparency on how much is RCN vs GUS/model), data-source composition, powiat GUS value, validation flags.
-- Deliverables:
-  - `data/processed/floorspace/gmina_floorspace_index_2021.parquet` and `.csv` (keyed by `JPT_KOD_JE`),
-  - `data/processed/floorspace/gmina_floorspace_index_2021.gpkg` (index joined to commune polygons for mapping),
-  - a run log and a diagnostics bundle (GUS-vs-index scatter, coverage, coefficient table, year-FE-vs-GUS path).
-
-All GeoPackage writes go through a local scratch dir then move (NFS-safe), following `commune_centroids.py`.
+Two-level Fay–Herriot (parametric empirical/hierarchical Bayes) on the gmina direct estimates:
+```
+θ̂_g = θ_g + e_g,  e_g ~ N(0, D_g);   θ_g = x_g'η + v_g,  v_g ~ N(0, A)
+```
+with `x_g` = { log GUS_median_powiat,2021 (prior mean, β≈1), RODZ gmina type, log gmina land price (dzialki), log population, gmina flat-share }. REML/moment estimation of (η, A); posterior `θ̃_g = x_g'η + A/(A+D_g)·(θ̂_g − x_g'η)`. Data-rich gminas ≈ direct estimate; thin gminas shrink to the GUS-anchored prediction; zero-RCN gminas take the prediction outright. `--bayes` runs full MCMC on the same area model. `--benchmark-to-gus` optionally rescales within-powiat weighted means to GUS exactly.
 
 ---
 
-## 7. Assumptions, risks, and how the design mitigates them
+## 6. Outputs
 
-1. **Proportional national price growth (year-FE pooling).** Baseline assumption; mitigated by the `woj_year` option and window restriction, and validated against GUS local series.
-2. **Flats-only GUS anchoring a flats+houses target.** Mitigated by the hedonic property-type differential (houses priced on the same scale as flats before anchoring) and by including gmina flat-share/RODZ in the area model. Residual house/flat level gaps are absorbed into `η`.
-3. **House floorspace scarcity (~50 k).** Houses inform the *national* property-type and size gradients (well-identified from pooled data) and the rural area-model covariates; they are not required to be dense in every gmina.
-4. **GUS ≠ independent of RCN flats.** Acknowledged; GUS is used as a prior/auxiliary and validation, not as independent measurement. The 0.982 reproduction is a cleaning check, not double counting.
-5. **Sparsity is the true limit.** Rural gmina values are effectively GUS-powiat + covariate predictions; the shrinkage weight column makes this explicit and honest for the paper.
-6. **Boundary/temporal TERYT changes** across the RCN span are handled by assigning gmina from 2021 polygons directly (geometry, not historical codes), sidestepping code-vintage issues.
+`index_zl_m2 = exp(θ̃_g)` — 2021 quality-adjusted zł/m² of living space for all 2,477 gminas, with posterior SD, shrinkage weight (RCN vs GUS/model), n_flats / n_houses, GUS anchor, local land price + fallback level, and validation flags. Written as `data/processed/floorspace/gmina_floorspace_index_2021.{csv,parquet,gpkg}` plus a diagnostics JSON (hedonic coefficients incl. market/floors/house, year-FE path, source composition, land-level counts). GeoPackage writes are NFS-safe (local scratch → move).
+
+---
+
+## 7. Assumptions and risks
+
+1. **Proportional national price growth** (year-FE pooling) — relaxed via `woj_year`/window; validated vs GUS.
+2. **Flats-only GUS anchoring a flats+houses target** — absorbed by the property-type differential and gmina flat-share covariate.
+3. **Self-constructed usable area** — `usable = footprint × floors × 0.73`; error controlled by overlap+floors+area gates and robust trimming; residual noise down-weighted, not trusted unconditionally.
+4. **Land netting** — raw-land netting of the plot is a standard residual method; capped and imputation-guarded; `regress`/`none` alternatives provided for robustness.
+5. **Sparsity remains the true limit** — rural gmina values are effectively GUS-powiat + covariate predictions; the shrinkage-weight and land-level columns make this explicit.
 
 ---
 
 ## 8. How to run
 
 ```
-python scripts/floorspace/run_index.py \
-    --year-min 2006 --year-max 2026 \
-    --time-fe year \
-    --workers $(nproc) \
-    [--bayes] [--benchmark-to-gus] \
-    [--sample-frac 0.02]        # fast smoke test
+python scripts/floorspace/run_index.py --workers $(nproc)          # full run (HPC)
+python scripts/floorspace/run_index.py --sample-frac 0.02          # fast smoke test
+python scripts/floorspace/run_index.py --house-land-netting regress   # plot as covariate
+python scripts/floorspace/run_index.py --house-max-floors 4 --no-dzialki-marginal
+python scripts/floorspace/run_index.py --year-min 2016 --time-fe woj_year --benchmark-to-gus
 ```
-Defaults resolve every path from the repository layout. `--sample-frac` runs the whole pipeline on a random subset for a quick end-to-end check before the full HPC run. See module docstrings for the full parameter list.
+All paths resolve from the repository layout. Key flags: `--house-land-netting {subtract,regress,none}`, `--house-max-floors`, `--house-use-nearest`, `--no-dzialki-marginal`, `--time-fe`, `--year-min/--year-max`, `--anchor {median,mean}`, `--benchmark-to-gus`, `--bayes`, `--sample-frac`.
 ```
 ```

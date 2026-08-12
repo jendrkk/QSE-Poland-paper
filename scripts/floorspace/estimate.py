@@ -40,50 +40,65 @@ LOGGER = logging.getLogger("floorspace.estimate")
 # --------------------------------------------------------------------------- #
 # Stage 3: hedonic
 # --------------------------------------------------------------------------- #
-def _build_controls(micro: pd.DataFrame):
+def _build_controls(micro: pd.DataFrame, plot_regressor: bool = False):
     """Return centred control matrix Z (dense) and its column names.
 
-    Missing rooms/floor/plot are mean-imputed with an accompanying missingness
-    indicator so their rows stay in the regression.
+    Structural controls span both dwelling types. Type-specific attributes
+    (flat storey, building floors, plot) are zero for the other type and carry a
+    missingness indicator, so a single pooled regression identifies each gradient
+    from the type that has it while keeping the gmina FE common. Controls are
+    centred so a gmina FE equals the predicted log(price/m2) of a mean dwelling
+    in 2021.
+
+    ``plot_regressor`` adds log(plot) for houses (used when house land is handled
+    by regression control rather than explicit subtraction).
     """
-    n = len(micro)
     area = micro["area"].to_numpy(float)
     log_area = np.log(area)
-    log_area2 = log_area ** 2
     house = (micro["property_type"].to_numpy() == "house").astype(float)
-    primary = (micro["market"].to_numpy() == "primary").astype(float)
+    mkt = micro["market"].to_numpy()
+    mkt_primary = (mkt == "primary").astype(float)
+    mkt_unknown = (mkt == "unknown").astype(float)
 
     rooms = micro["rooms"].to_numpy(float)
     has_rooms = np.isfinite(rooms).astype(float)
-    rooms = np.where(np.isfinite(rooms), rooms, np.nanmedian(rooms[np.isfinite(rooms)]) if np.isfinite(rooms).any() else 0.0)
+    rmed = np.nanmedian(rooms[np.isfinite(rooms)]) if np.isfinite(rooms).any() else 0.0
+    rooms = np.where(np.isfinite(rooms), rooms, rmed)
 
-    floor = micro["floor"].to_numpy(float)
-    has_floor = np.isfinite(floor).astype(float)
-    floor = np.where(np.isfinite(floor), floor, 0.0)
+    storey = micro["floor"].to_numpy(float)              # flat storey
+    has_storey = np.isfinite(storey).astype(float)
+    storey = np.where(np.isfinite(storey), storey, 0.0)
 
-    plot = micro["plot_area"].to_numpy(float)
-    log_plot = np.where((house == 1) & np.isfinite(plot) & (plot > 0), np.log(plot), 0.0)
+    bfl = micro["bld_floors"].to_numpy(float) if "bld_floors" in micro else np.full(len(micro), np.nan)
+    has_bfl = np.isfinite(bfl).astype(float)
+    bfl = np.where(np.isfinite(bfl), bfl, 0.0)
 
     cols = {
         "log_area": log_area,
-        "log_area2": log_area2,
+        "log_area2": log_area ** 2,
         "house": house,
-        "primary": primary,
+        "mkt_primary": mkt_primary,
+        "mkt_unknown": mkt_unknown,
         "rooms": rooms,
         "has_rooms": has_rooms,
-        "floor": floor,
-        "has_floor": has_floor,
-        "log_plot_house": log_plot,
+        "storey": storey,
+        "has_storey": has_storey,
+        "bld_floors": bfl,
+        "has_bld_floors": has_bfl,
     }
+    if plot_regressor:
+        plot = micro["plot_area"].to_numpy(float)
+        cols["log_plot_house"] = np.where(
+            (house == 1) & np.isfinite(plot) & (plot > 0), np.log(plot), 0.0
+        )
     names = list(cols)
     Z = np.column_stack([cols[k] for k in names]).astype(float)
-    # centre continuous / all controls so gmina FE = prediction at the mean dwelling
     Zc = Z - Z.mean(axis=0, keepdims=True)
     return Zc, names, Z.mean(axis=0)
 
 
 def fit_hedonic(micro: pd.DataFrame, time_fe: str = "year", ridge: float = 1e-6,
-                ref_year: int = 2021):
+                ref_year: int = 2021, plot_regressor: bool = False):
     """Estimate the national hedonic and return per-gmina direct estimates.
 
     Returns
@@ -126,7 +141,7 @@ def fit_hedonic(micro: pd.DataFrame, time_fe: str = "year", ridge: float = 1e-6,
         shape=(len(micro), len(keep_t)),
     )
 
-    Zc, znames, zmean = _build_controls(micro)
+    Zc, znames, zmean = _build_controls(micro, plot_regressor=plot_regressor)
     Zs = sp.csr_matrix(Zc)
 
     X = sp.hstack([G, T, Zs], format="csr")
@@ -181,8 +196,9 @@ def fit_hedonic(micro: pd.DataFrame, time_fe: str = "year", ridge: float = 1e-6,
         "n_gminas": nG,
     }
     LOGGER.info("Hedonic fit: R2=%.3f, sigma2=%.4f, gminas with direct est=%d", r2, sigma2, nG)
-    LOGGER.info("  key coefs: log_area=%.3f house=%.3f primary=%.3f",
-                ctrl.get("log_area", np.nan), ctrl.get("house", np.nan), ctrl.get("primary", np.nan))
+    LOGGER.info("  key coefs: log_area=%.3f house=%.3f mkt_primary=%.3f bld_floors=%.3f",
+                ctrl.get("log_area", np.nan), ctrl.get("house", np.nan),
+                ctrl.get("mkt_primary", np.nan), ctrl.get("bld_floors", np.nan))
     return direct, info
 
 

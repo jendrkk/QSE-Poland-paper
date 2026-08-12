@@ -145,6 +145,67 @@ def _ring_centroid(xs: np.ndarray, ys: np.ndarray):
     return float(cx), float(cy)
 
 
+def _read_poly_cxy_area(blob: bytes):
+    """Parse a GPKG (MULTI)POLYGON BLOB -> (cx, cy, area_m2).
+
+    Centroid is taken from the first polygon's outer ring (buildings/parcels are
+    small, so this is a safe representative interior point). ``area_m2`` is the
+    true polygon area (sum over polygons of exterior ring minus holes), which in
+    EPSG:2180 is metres^2 -- the reliable parcel/footprint area, immune to the
+    m2-vs-ha unit errors in the recorded attribute fields.
+    """
+    try:
+        off = _wkb_start(blob)
+        bo = blob[off]
+        end = "<" if bo == 1 else ">"
+        gtype = struct.unpack_from(end + "I", blob, off + 1)[0] % 1000
+        p = off + 5
+        polys = []
+        if gtype == 6:
+            n_poly = struct.unpack_from(end + "I", blob, p)[0]
+            p += 4
+            for _ in range(n_poly):
+                bo = blob[p]
+                end = "<" if bo == 1 else ">"
+                p += 5
+                p, a, ring0 = _poly_area(blob, p, end)
+                polys.append((a, ring0))
+        elif gtype == 3:
+            p, a, ring0 = _poly_area(blob, p, end)
+            polys.append((a, ring0))
+        else:  # point-like
+            x, y = struct.unpack_from(end + "dd", blob, p)
+            return x, y, np.nan
+        area = abs(sum(a for a, _ in polys))
+        cx, cy = _ring_centroid(polys[0][1][0], polys[0][1][1])
+        return cx, cy, area
+    except Exception:
+        return np.nan, np.nan, np.nan
+
+
+def _poly_area(blob, p, end):
+    """Read one WKB polygon from offset p; return (new_p, signed_area, first_ring_xy).
+
+    Exterior ring counts positive, interior rings (holes) subtracted.
+    """
+    n_rings = struct.unpack_from(end + "I", blob, p)[0]
+    p += 4
+    total = 0.0
+    ring0 = None
+    for i in range(n_rings):
+        n_pts = struct.unpack_from(end + "I", blob, p)[0]
+        p += 4
+        c = np.frombuffer(blob, dtype=(end + "f8"), count=2 * n_pts, offset=p)
+        p += 16 * n_pts
+        x = c[0::2]
+        y = c[1::2]
+        a = (x[:-1] * y[1:] - x[1:] * y[:-1]).sum() / 2.0
+        total += a if i == 0 else -abs(a)
+        if i == 0:
+            ring0 = (x, y)
+    return p, total, ring0
+
+
 # --------------------------------------------------------------------------- #
 # Numeric parsing
 # --------------------------------------------------------------------------- #
@@ -179,9 +240,11 @@ def _read_chunk(gpkg, table, columns, where, geom_kind, lo, hi):
         return None
     ncol = len(columns)
     data = {c: [] for c in columns}
-    xs = np.empty(len(rows), dtype="f8")
-    ys = np.empty(len(rows), dtype="f8")
-    reader = _read_point if geom_kind == "point" else _read_repr_point
+    n = len(rows)
+    xs = np.empty(n, dtype="f8")
+    ys = np.empty(n, dtype="f8")
+    want_area = geom_kind == "polygon"
+    areas = np.empty(n, dtype="f8") if want_area else None
     for i, r in enumerate(rows):
         for j, c in enumerate(columns):
             v = r[j]
@@ -190,11 +253,17 @@ def _read_chunk(gpkg, table, columns, where, geom_kind, lo, hi):
         if g is None:
             xs[i] = np.nan
             ys[i] = np.nan
+            if want_area:
+                areas[i] = np.nan
+        elif want_area:
+            xs[i], ys[i], areas[i] = _read_poly_cxy_area(g)
         else:
-            xs[i], ys[i] = reader(g)
+            xs[i], ys[i] = _read_point(g)
     df = pd.DataFrame(data)
     df["x2180"] = xs
     df["y2180"] = ys
+    if want_area:
+        df["geom_area_m2"] = areas
     return df
 
 
@@ -280,43 +349,15 @@ def _robust_trim(df, cfg: CleaningConfig):
     return out
 
 
-# --------------------------------------------------------------------------- #
-# Layer builders
-# --------------------------------------------------------------------------- #
-def _clean_flats(df, cfg: CleaningConfig):
-    df = df.copy()
-    df["price"] = _coalesce_price(df, "lok_cena_brutto")
-    df["area"] = _to_num(df["lok_pow_uzyt"])
-    df["rooms"] = _to_num(df["lok_liczba_izb"])
-    df["floor"] = _to_num(df["lok_nr_kond"])
-    df["plot_area"] = np.nan
-    df["year"] = _year_from_dokdata(df["dok_data"])
-    df["market"] = np.where(df["tran_rodzaj_rynku"].eq(MARKET_PRIMARY), "primary", "secondary")
-    df["property_type"] = "flat"
-    df["powiat_teryt"] = df["teryt"].astype("string")
-    df["unit_id"] = df["lok_id_lokalu"]
-    if cfg.drop_public_sellers:
-        df = df[~df["tran_sprzedajacy"].isin(list(config_public()))]
-    return _finalise(df, cfg, area_min=cfg.flat_area_min, area_max=cfg.flat_area_max)
+# unified micro schema shared by flats (rcn) and houses (houses.py)
+MICRO_COLS = [
+    "price", "area", "ppm2", "property_type", "market", "rooms", "floor",
+    "bld_floors", "plot_area", "year", "x2180", "y2180", "powiat_teryt",
+    "tran_lokalny_id_iip", "unit_id", "source", "qweight",
+]
 
-
-def _clean_houses(df, cfg: CleaningConfig):
-    df = df.copy()
-    df["price"] = _coalesce_price(df, "bud_cena_brutto")
-    df["area"] = _to_num(df["bud_pow_uzyt"])
-    df["rooms"] = np.nan
-    df["floor"] = np.nan
-    df["plot_area"] = _to_num(df["nier_pow_gruntu"])
-    df["year"] = _year_from_dokdata(df["dok_data"])
-    df["market"] = np.where(df["tran_rodzaj_rynku"].eq(MARKET_PRIMARY), "primary", "secondary")
-    df["property_type"] = "house"
-    df["powiat_teryt"] = df["teryt"].astype("string")
-    df["unit_id"] = df["bud_id_budynku"]
-    # plot sanity for houses
-    df = df[(df["plot_area"].isna()) | ((df["plot_area"] >= cfg.house_plot_min) & (df["plot_area"] <= cfg.house_plot_max))]
-    if cfg.drop_public_sellers:
-        df = df[~df["tran_sprzedajacy"].isin(list(config_public()))]
-    return _finalise(df, cfg, area_min=cfg.house_area_min, area_max=cfg.house_area_max)
+# public alias
+robust_trim = _robust_trim
 
 
 def config_public():
@@ -324,30 +365,24 @@ def config_public():
     return PUBLIC_SELLERS
 
 
-def _finalise(df, cfg: CleaningConfig, area_min, area_max):
-    """Shared row-level gates, dedup, ppm2, hard bounds. (Robust trim later,
-    after both layers are combined, so strata are shared.)"""
-    n0 = len(df)
-    df = df[
-        (df["price"] > 0)
-        & (df["area"] >= area_min)
-        & (df["area"] <= area_max)
-        & (df["year"] >= cfg.year_min)
-        & (df["year"] <= cfg.year_max)
-        & df["x2180"].notna()
-    ].copy()
-    df["ppm2"] = df["price"] / df["area"]
-    df = df[(df["ppm2"] >= cfg.ppm2_min) & (df["ppm2"] <= cfg.ppm2_max)]
-    # dedup: same unit, date, price; and same (tran id, unit id)
-    df = df.drop_duplicates(subset=["tran_lokalny_id_iip", "unit_id"])
-    df = df.drop_duplicates(subset=["unit_id", "dok_data", "price"])
-    LOGGER.info("  finalise %s: %s -> %s rows", df["property_type"].iloc[0] if len(df) else "?", f"{n0:,}", f"{len(df):,}")
-    return df
+def market_category(s: pd.Series) -> np.ndarray:
+    """Map tran_rodzaj_rynku -> {'primary','secondary','unknown'} (explicit
+    'unknown' so ~22% NULLs are not silently lumped with secondary)."""
+    from config import MARKET_SECONDARY
+    a = s.astype("object").to_numpy()
+    out = np.full(len(a), "unknown", dtype=object)
+    out[a == MARKET_PRIMARY] = "primary"
+    out[a == MARKET_SECONDARY] = "secondary"
+    return out
 
 
-def build_micro(cfg: CleaningConfig, workers: int, sample_frac: float | None = None):
-    """Construct the stacked flats+houses micro table (pre spatial join)."""
-    from config import LOKALE_GPKG, BUDYNKI_GPKG
+# --------------------------------------------------------------------------- #
+# Layer builder: flats (lokale)
+# --------------------------------------------------------------------------- #
+def build_flats(cfg: CleaningConfig, workers: int, sample_frac: float | None = None):
+    """Read + clean flats from lokale.gpkg. BOTH markets are kept; the market
+    is a covariate, not a filter."""
+    from config import LOKALE_GPKG
 
     flat_cols = [
         "teryt", "tran_rodzaj_trans", "tran_rodzaj_rynku", "tran_sprzedajacy",
@@ -359,46 +394,54 @@ def build_micro(cfg: CleaningConfig, workers: int, sample_frac: float | None = N
         "lok_funkcja='mieszkalna' AND tran_rodzaj_trans='wolnyRynek' "
         "AND (nier_udzial='1/1' OR nier_udzial IS NULL)"
     )
-    flats_raw = read_layer(LOKALE_GPKG, "lokale", flat_cols, flat_where, "point", workers)
+    df = read_layer(LOKALE_GPKG, "lokale", flat_cols, flat_where, "point", workers)
     if sample_frac:
-        flats_raw = flats_raw.sample(frac=sample_frac, random_state=0)
-    flats = _clean_flats(flats_raw, cfg)
+        df = df.sample(frac=sample_frac, random_state=0)
+    df = df.copy()
+    df["price"] = _coalesce_price(df, "lok_cena_brutto")
+    df["area"] = _to_num(df["lok_pow_uzyt"])
+    df["rooms"] = _to_num(df["lok_liczba_izb"])
+    df["floor"] = _to_num(df["lok_nr_kond"])   # storey the flat sits on
+    df["bld_floors"] = np.nan
+    df["plot_area"] = np.nan
+    df["year"] = _year_from_dokdata(df["dok_data"])
+    df["market"] = market_category(df["tran_rodzaj_rynku"])
+    df["property_type"] = "flat"
+    df["powiat_teryt"] = df["teryt"].astype("string")
+    df["unit_id"] = df["lok_id_lokalu"]
+    df["source"] = "flat"
+    df["qweight"] = 1.0
+    if cfg.drop_public_sellers:
+        df = df[~df["tran_sprzedajacy"].isin(list(config_public()))]
 
-    house_cols = [
-        "teryt", "tran_rodzaj_trans", "tran_rodzaj_rynku", "tran_sprzedajacy",
-        "dok_data", "nier_udzial", "nier_cena_brutto", "tran_cena_brutto",
-        "nier_rodzaj", "bud_rodzaj", "bud_pow_uzyt", "nier_pow_gruntu",
-        "bud_cena_brutto", "bud_id_budynku", "tran_lokalny_id_iip",
-    ]
-    house_where = (
-        f"nier_rodzaj='{BUD_HOUSE_NIER}' AND bud_rodzaj='{BUD_HOUSE_RODZAJ}' "
-        "AND bud_pow_uzyt IS NOT NULL AND bud_pow_uzyt<>'' "
-        f"AND tran_rodzaj_trans='{TRANS_ARM_LENGTH}' "
-        "AND (nier_udzial='1/1' OR nier_udzial IS NULL)"
-    )
-    houses_raw = read_layer(BUDYNKI_GPKG, "budynki", house_cols, house_where, "polygon", workers)
-    if sample_frac:
-        houses_raw = houses_raw.sample(frac=sample_frac, random_state=0)
-    houses = _clean_houses(houses_raw, cfg)
-
-    keep = [
-        "price", "area", "ppm2", "property_type", "market", "rooms", "floor",
-        "plot_area", "year", "x2180", "y2180", "powiat_teryt",
-        "tran_lokalny_id_iip", "unit_id",
-    ]
-    micro = pd.concat([flats[keep], houses[keep]], ignore_index=True)
-    micro = _robust_trim(micro, cfg)
-    LOGGER.info(
-        "MICRO assembled: %s rows (flats=%s, houses=%s)",
-        f"{len(micro):,}",
-        f"{(micro.property_type == 'flat').sum():,}",
-        f"{(micro.property_type == 'house').sum():,}",
-    )
-    return micro
+    n0 = len(df)
+    df = df[
+        (df["price"] > 0)
+        & (df["area"] >= cfg.flat_area_min)
+        & (df["area"] <= cfg.flat_area_max)
+        & (df["year"] >= cfg.year_min)
+        & (df["year"] <= cfg.year_max)
+        & df["x2180"].notna()
+    ].copy()
+    df["ppm2"] = df["price"] / df["area"]
+    df = df[(df["ppm2"] >= cfg.ppm2_min) & (df["ppm2"] <= cfg.ppm2_max)]
+    df = df.drop_duplicates(subset=["tran_lokalny_id_iip", "unit_id"])
+    df = df.drop_duplicates(subset=["unit_id", "dok_data", "price"])
+    LOGGER.info("FLATS assembled: %s -> %s rows", f"{n0:,}", f"{len(df):,}")
+    return df[MICRO_COLS]
 
 
+# --------------------------------------------------------------------------- #
+# Layer builder: undeveloped residential land (dzialki) -> land-price points
+# --------------------------------------------------------------------------- #
 def build_land(cfg: CleaningConfig, workers: int, sample_frac: float | None = None):
-    """Undeveloped residential-land transactions for the gmina land covariate."""
+    """Undeveloped residential/building-land transactions used to (a) net the
+    plot value out of house prices and (b) supply a gmina land-price covariate.
+
+    Land price/m2 uses the polygon GEOMETRY area (reliable m^2), not
+    ``dzi_pow_ewid`` (~9% of which are ha-coded). A cross-check flags/omits
+    rows where the recorded area is ha-coded relative to geometry.
+    """
     from config import DZIALKI_GPKG
 
     cols = [
@@ -408,25 +451,31 @@ def build_land(cfg: CleaningConfig, workers: int, sample_frac: float | None = No
     ]
     where = (
         f"nier_rodzaj='{DZI_UNDEVELOPED}' AND tran_rodzaj_trans='{TRANS_ARM_LENGTH}' "
+        "AND (nier_udzial='1/1' OR nier_udzial IS NULL) "
         "AND (dzi_przezn_wmpzp LIKE '%budownictwoMieszkaniowe%' "
         "OR dzi_sposob_uzyt='gruntyZabudowaneIZurbanizowane')"
     )
-    raw = read_layer(DZIALKI_GPKG, "dzialki", cols, where, "polygon", workers)
+    df = read_layer(DZIALKI_GPKG, "dzialki", cols, where, "polygon", workers)
     if sample_frac:
-        raw = raw.sample(frac=sample_frac, random_state=0)
-    df = raw.copy()
+        df = df.sample(frac=sample_frac, random_state=0)
+    df = df.copy()
     price = _to_num(df["nier_cena_brutto"])
-    price = price.where(price > 0, _to_num(df["dzi_cena_brutto"]))
-    area = _to_num(df["dzi_pow_ewid"])
-    df["land_price"] = price
-    df["land_area"] = area
+    df["land_price"] = price.where(price > 0, _to_num(df["dzi_cena_brutto"]))
+    df["geom_area_m2"] = pd.to_numeric(df["geom_area_m2"], errors="coerce")
+    rec_area = _to_num(df["dzi_pow_ewid"])
+    # unit-error diagnostic: recorded / geometry (ha-coded rows have ratio ~1e-4)
+    ratio = rec_area / df["geom_area_m2"]
+    df["ha_flag"] = ratio < cfg.land_ha_ratio_max
+    if cfg.land_area_source == "geometry":
+        df["land_area"] = df["geom_area_m2"]
+    else:
+        df["land_area"] = rec_area
     df["year"] = _year_from_dokdata(df["dok_data"])
     df = df[(df["land_price"] > 0) & (df["land_area"] > 0) & df["x2180"].notna()]
     df["land_ppm2"] = df["land_price"] / df["land_area"]
-    # broad land sanity gate
-    df = df[(df["land_ppm2"] >= 1) & (df["land_ppm2"] <= 20_000)]
+    df = df[(df["land_ppm2"] >= cfg.land_ppm2_min) & (df["land_ppm2"] <= cfg.land_ppm2_max)]
     df = df[(df["year"] >= cfg.year_min) & (df["year"] <= cfg.year_max)]
     df = df.drop_duplicates(subset=["tran_lokalny_id_iip"])
     df = df.rename(columns={"teryt": "powiat_teryt"})
-    LOGGER.info("LAND assembled: %s residential-land transactions", f"{len(df):,}")
+    LOGGER.info("LAND assembled: %s residential-land transactions (geom-area basis)", f"{len(df):,}")
     return df[["x2180", "y2180", "powiat_teryt", "land_ppm2", "year"]]

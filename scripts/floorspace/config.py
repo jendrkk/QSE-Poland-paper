@@ -28,7 +28,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 FLOORSPACE_DIR = REPO_ROOT / "data" / "raw" / "floorspace"
 LOKALE_GPKG = FLOORSPACE_DIR / "lokale.gpkg"
-BUDYNKI_GPKG = FLOORSPACE_DIR / "budynki.gpkg"
+BUDYNKI_GPKG = FLOORSPACE_DIR / "budynki.gpkg"            # legacy (superseded)
+BUDYNKI_BDOT_GPKG = FLOORSPACE_DIR / "budynki_bdot10k.gpkg"          # houses (BDOT10k floors -> usable area)
+BUDYNKI_DZIALKI_GPKG = FLOORSPACE_DIR / "budynki_dzialki_bdot10k.gpkg"  # building<->parcel bridge
 DZIALKI_GPKG = FLOORSPACE_DIR / "dzialki.gpkg"
 GUS_MEDIAN_CSV = FLOORSPACE_DIR / "GUS_P3787_median_price_residential_floorspace_1m2.csv"
 GUS_MEAN_CSV = FLOORSPACE_DIR / "GUS_P3788_mean_price_residential_floorspace_1m2.csv"
@@ -70,6 +72,10 @@ BUD_HOUSE_NIER = "nieruchomoscGruntowaZabudowana"  # a building on its own plot
 BUD_HOUSE_RODZAJ = "mieszkalny"
 BUD_FLAT_FOOTPRINT_NIER = "nieruchomoscLokalowa"   # footprint of a flat sale -> discard
 
+# BDOT10k enrichment (budynki_bdot10k / budynki_dzialki)
+BDOT_MATCH_OVERLAP = "overlap"     # reliable spatial match; "nearest" is noisy -> excluded by default
+BDOT_USABLE_COL = "usable_area_est_m2"   # = footprint_m2 * bdot_floors * (~0.73 usable/gross factor)
+
 # dzialki: land property kinds
 DZI_UNDEVELOPED = "nieruchomoscGruntowaNiezabudowana"
 DZI_DEVELOPED = "nieruchomoscGruntowaZabudowana"
@@ -104,6 +110,28 @@ class CleaningConfig:
     robust_min_stratum: int = 30     # else fall back to coarser stratum
     # exclude public/discounted sellers as robustness (kept by default: arm's length already filters)
     drop_public_sellers: bool = False
+
+    # --- BDOT10k house (self-constructed usable area) quality gates ---
+    house_use_nearest: bool = False   # include match_type='nearest' (noisy: outbuildings) -- off
+    house_min_overlap: float = 0.30   # min match_overlap_frac for overlap matches
+    house_min_floors: int = 1
+    house_max_floors: int = 5         # >=6 are mismatches / not single/low-multi-family houses
+    house_usable_min: float = 25.0    # m2 of estimated usable area
+    house_usable_max: float = 1000.0
+
+    # --- land (dzialki) quality + netting ---
+    land_area_source: str = "geometry"   # {"geometry","dzi_pow_ewid"}; geometry avoids ha unit errors
+    land_ha_ratio_max: float = 0.02      # drop rows where recorded/geom area ratio < this (ha-coded)
+    land_ppm2_min: float = 1.0
+    land_ppm2_max: float = 20_000.0
+    land_min_txn_gmina: int = 15         # min undeveloped-land txns for a gmina land price; else fall back
+    # land netting for houses: floorspace_price = (P_total - p_land*plot)/usable
+    house_land_netting: str = "subtract"   # {"subtract","regress","none"}
+    land_share_cap: float = 0.60           # cap land value at this fraction of the transaction price
+    house_ppm2_min: float = 500.0          # post-netting structure price/m2 bounds
+    house_ppm2_max: float = 40_000.0
+    # marginal rural houses recovered from dzialki+budynki_dzialki
+    use_dzialki_marginal_houses: bool = True
 
 
 @dataclass
