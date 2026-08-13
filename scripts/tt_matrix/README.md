@@ -60,6 +60,41 @@ because the error is spatially correlated with the Polska A/B gradient. The
 verdict prints `maxspeed` coverage by class so the choice is data-driven, not a
 guess.
 
+### Cross-year counterfactuals (RQ1) — use a consistent speed rule
+
+`--speed-source tag` (default) prefers explicit `maxspeed` and is the most
+accurate rule for a **single** year. It is **wrong for differencing two years**:
+2012 OSM is ~3–11% `maxspeed`-tagged (roads inherit the optimistic 90 km/h rural
+default) while 2021 is 23–99% tagged with the real, often-lower in-town limits.
+Effective primary/secondary/tertiary speeds come out ~10–16% *lower* in 2021, so
+`t_2021 − t_2012 > 0` on most pairs even though only motorways were added — a
+data-coverage artifact, not infrastructure.
+
+For RQ1, route both networks under **one** speed rule so only topology/road-class
+changes:
+
+```bash
+# 1) derive an empirical class profile once from the well-tagged 2021 network
+python road_travel_time_matrix.py --network .../poland_roads_2021-12-31_optimal.osm.pbf \
+    --builtup-detection grid --population-grid data/raw/pop/poland_bbox_pop_100m.parquet \
+    --dump-speed-profile data/processed/tt_matrix/speed_profile_empirical_2021.json
+
+# 2) route EVERY year with that profile, class-only, grid built-up
+for yr in 2012 2021 ; do
+  python road_travel_time_matrix.py \
+    --network data/raw/osm_pbf/poland_roads_${yr}-12-31_optimal.osm.pbf \
+    --centroid-type pop-weighted --workers 40 \
+    --speed-source class \
+    --speed-profile data/processed/tt_matrix/speed_profile_empirical_2021.json \
+    --builtup-detection grid --population-grid data/raw/pop/poland_bbox_pop_100m.parquet
+done
+```
+
+Under a fixed speed rule the counterfactual is monotone: a richer network is
+weakly faster on every pair (verified). Keep the **default `--speed-source tag`**
+run of the 2021 network too — it is the most accurate *absolute* 2021 baseline
+for calibration; the class-only pair is for the 2012-vs-2021 *comparison*.
+
 ### Network validation verdict
 Before routing the script prints **GOOD / USABLE-WITH-CAVEATS / BAD** with
 reasons: giant-SCC node share (fragmentation), `maxspeed` coverage on primary+

@@ -210,14 +210,21 @@ def parse_maxspeed(raw) -> tuple[float | None, bool]:
     return None, False
 
 
-def resolve_speed(ms_raw, hwy, builtup, profile, speed_factor):
+def resolve_speed(ms_raw, hwy, builtup, profile, speed_factor, use_tags=True):
     """Free-flow speed (km/h) and whether an explicit maxspeed tag was used.
 
-    Precedence: explicit ``maxspeed`` (as-is) -> class default (rural/built-up)
-    times ``speed_factor``.
+    ``use_tags`` True  (``--speed-source tag``, default): explicit ``maxspeed``
+    (as-is) -> class default (rural/built-up) x ``speed_factor``. This is the
+    most accurate *single-year* rule.
+
+    ``use_tags`` False (``--speed-source class``): ignore ``maxspeed`` entirely
+    and always use the class default. Use this for **cross-year counterfactuals**
+    (RQ1) so both networks are routed under an identical speed rule and only the
+    topology/road-class differs -- otherwise the year-dependent maxspeed coverage
+    (2.8% in 2012 vs 80%+ in 2021) makes the better-tagged year look slower.
     """
     ms, explicit = parse_maxspeed(ms_raw)
-    if ms is not None:
+    if use_tags and ms is not None:
         return ms, True
     rural, urban = profile.get(hwy, (40.0, 40.0))
     base = urban if builtup else rural
@@ -319,8 +326,11 @@ def _segment_lengths(geod, lons, lats) -> np.ndarray:
 # Graph assembly (vectorised, compact arrays)
 # --------------------------------------------------------------------------- #
 def build_graph(ways, profile, speed_factor, builtup_mode,
-                pop_tree, pop_cellsize, ambig, to_metric):
+                pop_tree, pop_cellsize, ambig, to_metric, speed_source="tag"):
     """Assemble a directed graph from parsed ways.
+
+    ``speed_source`` is ``tag`` (explicit maxspeed first) or ``class`` (class
+    defaults only; consistent across years for counterfactuals).
 
     Returns a dict with node coordinates and directed-edge arrays
     (``eu, ev`` int32 node ids; ``el`` length m; ``et`` time s; ``ec``
@@ -351,9 +361,12 @@ def build_graph(ways, profile, speed_factor, builtup_mode,
     for wi, w in enumerate(ways):
         hwy, ms, zone = w[3], w[4], w[8]
         _, explicit = parse_maxspeed(ms)
+        # In class mode the class default is used even where a tag exists, so
+        # built-up status must be resolved for every ambiguous way.
+        tag_wins = (speed_source == "tag") and explicit
         if hwy in ("residential", "living_street", "service"):
             builtup[wi] = True
-        if hwy in ambig and not explicit and builtup_mode != "none":
+        if hwy in ambig and not tag_wins and builtup_mode != "none":
             ambig_unres[wi] = True
             sig = builtup_from_zone(zone)
             if sig is not None:
@@ -380,7 +393,8 @@ def build_graph(ways, profile, speed_factor, builtup_mode,
     for wi, w in enumerate(ways):
         refs, lons, lats, hwy, ms, ow, junc, lanes, _zone = w
         bu = builtup[wi]
-        speed, used_explicit = resolve_speed(ms, hwy, bu, profile, speed_factor)
+        speed, used_explicit = resolve_speed(ms, hwy, bu, profile, speed_factor,
+                                             use_tags=(speed_source == "tag"))
 
         forward = backward = True
         if ow in _ONEWAY_YES or junc == "roundabout" or hwy == "motorway":
@@ -441,6 +455,77 @@ def build_graph(ways, profile, speed_factor, builtup_mode,
 
 
 # --------------------------------------------------------------------------- #
+# Empirical per-class speed profile (derive from a well-tagged network)
+# --------------------------------------------------------------------------- #
+def _lw_median(lengths, speeds):
+    """Length-weighted median of ``speeds``."""
+    if not lengths:
+        return float("nan")
+    order = np.argsort(speeds)
+    s = np.asarray(speeds, float)[order]
+    L = np.asarray(lengths, float)[order]
+    c = np.cumsum(L)
+    if c[-1] <= 0:
+        return float("nan")
+    return float(s[min(np.searchsorted(c, c[-1] / 2.0), len(s) - 1)])
+
+
+def derive_speed_profile(ways, profile, builtup_mode, pop_tree, pop_cellsize,
+                         ambig, to_metric, min_km=30.0):
+    """Length-weighted median tagged ``maxspeed`` per (class, rural/built-up),
+    from a well-tagged network (e.g. 2021), falling back to the statutory
+    default where a cell has < ``min_km`` of tagged length. The result, applied
+    to *every* year via ``--speed-profile --speed-source class``, gives a
+    consistent, empirically grounded speed rule for counterfactuals.
+    Returns ``{class: [rural, urban]}``.
+    """
+    from pyproj import Geod
+    geod = Geod(ellps="WGS84")
+
+    n = len(ways)
+    builtup = [False] * n
+    grid_idx, grid_mid = [], []
+    for wi, w in enumerate(ways):
+        hwy, zone = w[3], w[8]
+        if hwy in ("residential", "living_street", "service"):
+            builtup[wi] = True
+        if hwy in ambig and builtup_mode != "none":
+            sig = builtup_from_zone(zone)
+            if sig is not None:
+                builtup[wi] = sig
+            elif builtup_mode == "grid" and pop_tree is not None:
+                lons, lats = w[1], w[2]
+                grid_idx.append(wi)
+                grid_mid.append((lons[len(lons) // 2], lats[len(lats) // 2]))
+    if grid_idx:
+        arr = np.asarray(grid_mid)
+        mx, my = to_metric.transform(arr[:, 0], arr[:, 1])
+        d, _ = pop_tree.query(np.column_stack([mx, my]), k=1)
+        for j, wi in enumerate(grid_idx):
+            builtup[wi] = bool(d[j] <= pop_cellsize)
+
+    acc: dict[tuple, tuple[list, list]] = {}
+    for wi, w in enumerate(ways):
+        ms, expl = parse_maxspeed(w[4])
+        if not expl:
+            continue
+        L = float(np.sum(_segment_lengths(geod, w[1], w[2])))
+        acc.setdefault((w[3], builtup[wi]), ([], []))
+        acc[(w[3], builtup[wi])][0].append(L)
+        acc[(w[3], builtup[wi])][1].append(ms)
+
+    out = {}
+    for hwy, (r_def, u_def) in profile.items():
+        rl, rs = acc.get((hwy, False), ([], []))
+        ul, us = acc.get((hwy, True), ([], []))
+        r = _lw_median(rl, rs) if sum(rl) >= min_km * 1000 else float("nan")
+        u = _lw_median(ul, us) if sum(ul) >= min_km * 1000 else float("nan")
+        out[hwy] = [round(r / 5) * 5 if r == r else r_def,
+                    round(u / 5) * 5 if u == u else u_def]
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Giant strongly-connected component (scipy, memory-light)
 # --------------------------------------------------------------------------- #
 def giant_scc(n, eu, ev, el, et, ec):
@@ -485,9 +570,10 @@ def simplify_graph(n, u, v, length, time_s, cap, protected_mask):
     length = length.astype(np.float64); time_s = time_s.astype(np.float64)
     cap = cap.astype(np.float64)
 
-    # Dedup directed parallels: keep first occurrence per (u, v).
+    # Dedup directed parallels: keep the FASTEST edge per (u, v). lexsort orders
+    # by key then time ascending, so the first row of each key group is min-time.
     key = u * n + v
-    order = np.argsort(key, kind="stable")
+    order = np.lexsort((time_s, key))
     ks = key[order]
     firstmask = np.empty(len(ks), bool)
     firstmask[0] = True
@@ -863,8 +949,19 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--n-centroids", type=int, default=3,
                    help="For --centroid-type multiple: max candidates per commune.")
     p.add_argument("--workers", type=int, default=os.cpu_count() or 4)
+    p.add_argument("--speed-source", choices=["tag", "class"], default="tag",
+                   help="tag: explicit maxspeed first (best single-year accuracy). "
+                        "class: ignore maxspeed, use class defaults only -- REQUIRED "
+                        "for cross-year counterfactuals so 2012 and 2021 share one "
+                        "speed rule (else better-tagged years look slower).")
     p.add_argument("--speed-profile", type=Path, default=None,
-                   help="JSON override for class defaults {class:[rural,urban]}.")
+                   help="JSON override for class defaults {class:[rural,urban]}. "
+                        "Pair with --speed-source class + an empirical profile from "
+                        "--dump-speed-profile for consistent counterfactual speeds.")
+    p.add_argument("--dump-speed-profile", type=Path, default=None,
+                   help="Derive an empirical {class:[rural,urban]} profile (median "
+                        "tagged maxspeed) from --network, write it to this JSON, and "
+                        "exit. Run once on the well-tagged 2021 network.")
     p.add_argument("--speed-factor", type=float, default=1.0,
                    help="Multiplier on CLASS-DEFAULT speeds only (not explicit "
                         "maxspeed). <1 approximates realistic average speeds.")
@@ -956,12 +1053,32 @@ def main(argv=None) -> int:
         pop_tree = build_pop_tree(args.population_grid, args.builtup_pop_threshold,
                                   to_metric)
 
+    if args.speed_source == "class" and args.builtup_detection == "none":
+        LOGGER.warning("--speed-source class with --builtup-detection none treats "
+                       "all ambiguous roads as rural -> overstates in-town speeds. "
+                       "Use --builtup-detection grid for a consistent split.")
+
     ways = parse_pbf_ways(args.network)
     if not ways:
         LOGGER.error("No drivable ways parsed -- is this a road-filtered PBF?")
         return 3
+
+    if args.dump_speed_profile is not None:
+        prof = derive_speed_profile(ways, profile, args.builtup_detection,
+                                    pop_tree, cellsize, ambig, to_metric)
+        args.dump_speed_profile.parent.mkdir(parents=True, exist_ok=True)
+        with open(args.dump_speed_profile, "w") as fh:
+            json.dump(prof, fh, indent=2)
+        LOGGER.info("Empirical speed profile [class: [rural, urban]] km/h:")
+        for k, v in prof.items():
+            LOGGER.info("    %-14s %s", k, v)
+        LOGGER.info("Wrote: %s", args.dump_speed_profile)
+        print(str(args.dump_speed_profile))
+        return 0
+
     G = build_graph(ways, profile, args.speed_factor, args.builtup_detection,
-                    pop_tree, cellsize, ambig, to_metric)
+                    pop_tree, cellsize, ambig, to_metric,
+                    speed_source=args.speed_source)
     del ways
     LOGGER.info("Graph: %s nodes, %s directed edges",
                 f"{G['n_nodes']:,}", f"{len(G['eu']):,}")
@@ -1070,6 +1187,8 @@ def main(argv=None) -> int:
         "network": str(args.network), "communes": str(args.communes),
         "centroid_type": args.centroid_type,
         "n_centroids": args.n_centroids if args.centroid_type == "multiple" else 1,
+        "speed_source": args.speed_source,
+        "speed_profile": str(args.speed_profile) if args.speed_profile else "statutory",
         "speed_factor": args.speed_factor, "builtup_detection": args.builtup_detection,
         "units": "minutes", "verdict": verdict, "verdict_reasons": reasons,
         "stats": {k: (float(v) if isinstance(v, (int, float, np.floating)) else v)
