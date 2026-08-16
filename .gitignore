@@ -6,7 +6,7 @@
 # Raw data
 data/raw/
 data/processed/tt_matrix/
-
+data/processed/floorspace/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
