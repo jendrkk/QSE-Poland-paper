@@ -1,0 +1,100 @@
+# =============================================================================
+# config/baseline.yaml — central configuration for the MRRH Poland baseline.
+#
+# The orchestrator (run_baseline.py) reads this file, passes it to the toolkit,
+# and copies the resolved version into each run folder. Every structural
+# parameter is a documented knob; nothing is hard-coded in the package.
+#
+# Paths are relative to the repository root (the folder that contains config/).
+# Override the root at run time with:  run_baseline.py --repo-root /path/to/repo
+# =============================================================================
+
+tag: baseline
+
+# -----------------------------------------------------------------------------
+# Structural parameters. Defaults carry a literature source; see qse_poland_paper/
+# config.py for the full provenance notes. phi = epsi*mu is ESTIMATED in-sample
+# (phi_mode: estimate) from the commuting gravity for years with observed flows,
+# and BORROWED from 2021 for 2026. Report the sensitivity grids.
+# -----------------------------------------------------------------------------
+params:
+  alpha: 0.70          # tradables share; 1-alpha = 0.30 floor-space/housing share.
+                       # SW2020 value / user's lean. Poland's true floor-space share
+                       # is uncertain (EU COICOP-04 housing ~23.6% (Eurostat 2024),
+                       # Poland below average, large utilities component). See grid.
+  epsi: 4.60           # Frechet shape (SW2020). Only phi=epsi*mu is identified; epsi
+                       # calibrated, mu residual. See grid.
+  mu: 0.47             # used only if phi_mode: fixed
+  sigg: 4.00           # CES / trade elasticity sigma-1 = 3 (Broda-Weinstein 2004)
+  nu: 0.05             # agglomeration elasticity (Combes-Gobillon-Puga 0.02-0.05)
+  delta: 0.38          # housing supply elasticity (SW2020; Poland IV-estimable later)
+  psi: 0.42            # trade-cost distance elasticity (Head-Mayer); builds dni from tau
+  fixC: 1.00
+  phi_mode: estimate   # estimate | fixed
+  reimpute_tau_diagonal: false   # delivered TTMs already carry an imputed diagonal
+  own_time_c: 0.6666666666666666
+  own_time_speed_kmh: 30.0
+  own_time_floor_min: 3.0
+  sensitivity:
+    alpha: [0.70, 0.75, 0.80]
+    epsi:  [3.0, 4.0, 4.6, 6.0]
+    sigg:  [3.0, 4.0, 6.0]
+    nu:    [0.02, 0.05]
+    own_time_speed_kmh: [25.0, 30.0, 40.0]
+
+# -----------------------------------------------------------------------------
+# Per-year data specification. flows: null triggers gravity generation (2026).
+# ttm_tag becomes part of the run id: runs/<year>_<ttm_tag>_<tag>/.
+# -----------------------------------------------------------------------------
+years:
+  2011:
+    ttm: data/processed/tt_matrix/ttm_road_garmin_2011_final.npz
+    wages: data/processed/labour_market/labor_tidy_2011.csv
+    floorspace: data/processed/floorspace/gmina_floorspace_index_2021.csv
+    flows: data/raw/bilateral/bilateral_matrix_2011.xls
+    flow_source_year: 2011
+    ttm_tag: garmin
+  2021:
+    ttm: data/processed/tt_matrix/ttm_road_osm_2021_final.npz
+    wages: data/processed/labour_market/labor_tidy_2021.csv
+    floorspace: data/processed/floorspace/gmina_floorspace_index_2021.csv
+    flows: data/raw/bilateral/bilateral_matrix_2021.xlsx
+    flow_source_year: 2021
+    ttm_tag: osm
+  2026:
+    ttm: data/processed/tt_matrix/ttm_road_osm_2026_final.npz
+    wages: data/processed/labour_market/labor_tidy_2026.csv
+    floorspace: data/processed/floorspace/gmina_floorspace_index_2021.csv
+    flows: null                 # not observed -> generate from margins + travel time
+    borrow_params_from: 2021    # borrow the estimated phi
+    ttm_tag: osm
+
+# -----------------------------------------------------------------------------
+# Solver tolerances and gates.
+# -----------------------------------------------------------------------------
+solver:
+  prod_maxiter: 5000
+  prod_relax: 0.25
+  prod_precision: 6
+  prod_tol: 1.0e-8
+  flowgen_maxiter: 2000
+  flowgen_tol: 1.0e-3
+  cf_tol: 1.0e-4
+  cf_maxiter: 100000
+  cf_relax: 0.25
+  gravity_include_diagonal: false
+  gravity_fe_maxiter: 200
+  gravity_fe_tol: 1.0e-10
+  strict_invariants: true
+  reconcile_margins: true    # IPF-rake observed flows to trusted labour margins (phi-invariant)
+  ipf_maxiter: 200
+  ipf_tol: 1.0e-9
+
+# -----------------------------------------------------------------------------
+# Paths (relative to repo root unless absolute).
+# -----------------------------------------------------------------------------
+paths:
+  repo_root: null      # resolved at runtime (default: parent of config/)
+  crosswalk: data/processed/labour_market/teryt_gmina_crosswalk_2021.csv
+  shapefile: data/processed/shapefiles/communes_2021.gpkg
+  runs_dir: runs

@@ -1,0 +1,14 @@
+# qse_poland_paper — baseline MRRH toolkit dependencies
+numpy>=1.24
+pandas>=2.0
+pyyaml>=6.0
+matplotlib>=3.7
+geopandas>=0.14
+mapclassify>=2.6      # Jenks natural breaks for choropleths
+openpyxl>=3.1         # 2021 bilateral flow matrix (.xlsx)
+xlrd>=2.0             # 2011 bilateral flow matrix (.xls)
+pyarrow>=12.0         # optional: parquet floor-space index
+
+# LaTeX figures (house style) additionally require, on the system:
+#   a TeX distribution (latex), plus cm-super, mathpazo (psnfss) and dvipng.
+# Without them, run_viz falls back to matplotlib mathtext automatically.
