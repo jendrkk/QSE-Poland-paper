@@ -418,6 +418,7 @@ def _gpkg_resolve_hwy(cls, lbl1, promote_numbered):
     """Resolve OSM highway class from Garmin cls + lbl1, applying Polish
     hierarchy and the A#/S# override for Garmin's mixed 'motorway' bucket."""
     if promote_numbered and lbl1:
+        lbl1 = str(lbl1)
         s = lbl1.strip()
         if _A_ROAD_RE.match(s):
             return "motorway"        # autostrada, statutory 140
@@ -436,6 +437,7 @@ def _promote_by_number(kmh, lbl1):
     """
     if not lbl1:
         return kmh
+    lbl1 = str(lbl1)
     s = lbl1.strip()
     if _A_ROAD_RE.match(s):
         return max(kmh or 0, 140)

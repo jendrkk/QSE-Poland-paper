@@ -138,8 +138,11 @@ def build_houses_marginal(cfg: CleaningConfig, workers: int, exclude_tran_ids, s
     LOGGER.info("  bridge: %s parcels with residential usable area", f"{len(parcel):,}")
 
     # 2b. built-up priced parcel transactions (with parcel geometry -> plot area)
+    # NOTE: dzialki.gpkg has NO tran_cena_brutto; prices are nier_cena_brutto /
+    # dzi_cena_brutto only. Use the property price (nier), fall back to the parcel
+    # component price (dzi).
     dcols = [
-        "teryt", "tran_rodzaj_rynku", "dok_data", "nier_cena_brutto", "tran_cena_brutto",
+        "teryt", "tran_rodzaj_rynku", "dok_data", "nier_cena_brutto", "dzi_cena_brutto",
         "nier_pow_gruntu", "dzi_id_dzialki", "tran_lokalny_id_iip",
     ]
     dwhere = (
@@ -157,7 +160,7 @@ def build_houses_marginal(cfg: CleaningConfig, workers: int, exclude_tran_ids, s
     dz = dz.merge(parcel[["dzi_id_dzialki", "usable_area", "bld_floors"]], on="dzi_id_dzialki", how="inner")
 
     dz["price"] = rcn._to_num(dz["nier_cena_brutto"])
-    dz["price"] = dz["price"].where(dz["price"] > 0, rcn._to_num(dz["tran_cena_brutto"]))
+    dz["price"] = dz["price"].where(dz["price"] > 0, rcn._to_num(dz["dzi_cena_brutto"]))
     dz["year"] = rcn._year_from_dokdata(dz["dok_data"])
     dz["market"] = rcn.market_category(dz["tran_rodzaj_rynku"])
     dz["plot_num"] = dz["geom_area_m2"]                     # reliable m^2 parcel area
