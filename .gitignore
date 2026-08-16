@@ -5,9 +5,18 @@
 
 # Raw data
 data/raw/
+
+# Processed data
+
+## TT matrix
 data/processed/tt_matrix/
+## Floorspace
 data/processed/floorspace/
+## Labour market
 data/processed/labour_market/
+
+# Temp files
+_to_delete/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

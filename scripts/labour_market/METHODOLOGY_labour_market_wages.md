@@ -72,27 +72,43 @@ dissolved gmina across two absorbers (72/28 by population). Extensive quantities
 
 ## 3. Wages: powiat → gmina disaggregation
 
-Gmina workplace wages exist only from 2024 (P4609, GUS *Rozkład wynagrodzeń*);
-for 2011 and 2021 only the powiat aggregate (P2497, workplace-based) is observed.
-We transfer the **within-powiat wage structure** learned on the modern gmina
-cross-section back in time and pin the level to the observed powiat total —
-the same empirical-Bayes-to-anchor + exact-benchmark logic used in
-`scripts/floorspace`.
+> **"Median" is a schema label, not the statistic.** Both P2497 and P4609 report
+> *przeciętne* (arithmetic **mean**) gross wages, and we use the mean throughout
+> for cross-year consistency (only the mean exists at powiat for 2011/2021). The
+> output column is nonetheless named `median_income_workplace` because that is
+> the exact field `dataio.load()` reads. Verified: the employment-weighted mean
+> of P4609 gmina wages reproduces P2497 at powiat (ratio ≈ 0.94, sd 0.045 across
+> 379 powiats) — same concept, the ~6 % gap being the products' different
+> employment universes. We therefore take the **level** from P2497 and only the
+> within-powiat **structure** from P4609, which is robust to that gap.
 
-1. **Transfer model.** On the recent gmina cross-section fit
-   `log w_it = c_{p(i)} + xᵢₜ'β + eᵢₜ` with powiat fixed effects (within
-   transform), so `β` is the *within-powiat* gradient of log wage on covariates
-   `x` = (log workplace employment, urban dummy, urban-rural dummy). Estimated
-   values are all positive (larger, more urban gminas pay more within their
-   powiat), `resid_sd ≈ 0.10`.
-2. **Predict** a shrunk within-powiat log deviation for a historical year,
-   `dᵢ = λ · β'(xᵢ − x̄_{p(i)})`, using year-specific covariates; `λ`
-   (`--struct-shrinkage`, default 0.75) guards against over-extrapolating the
-   modern gradient.
-3. **Exact benchmark.** Rake to the observed powiat wage,
-   `wᵢ = W_p · exp(dᵢ) / Σ_{j∈p} sⱼ exp(dⱼ)`, `sⱼ = empⱼ / Σ emp`, so the
-   employment-weighted gmina mean reproduces P2497 **to machine precision** and
-   every gmina receives a value.
+Gmina workplace wages exist only from 2024 (P4609, GUS *Rozkład wynagrodzeń*);
+for 2011 and 2021 only the powiat aggregate (P2497) is observed. The powiat mean
+**is** the employment-weighted mean of its gmina means, so the disaggregation is
+a weighted structure-transfer that reproduces that identity exactly.
+
+1. **Modern structure.** From the recent gmina cross-section compute each gmina's
+   within-powiat relative wage
+   `r_g = w_g^recent / (Σ_{j∈p} s_j^recent w_j^recent)`,
+   `s_j = emp_j / Σ emp`. This carries the **full** observed within-powiat
+   structure — including the gmina-specific component, *not merely what a few
+   covariates explain*. (An earlier covariate-only model transferred only the
+   systematic part, whose gradient is small, and so reproduced just ~43 % of the
+   observed within-powiat dispersion — visible as spurious "powiat-border"
+   discontinuities. The ratio transfer restores it to ~85 %.)
+2. **Transfer with mild shrinkage.** `r_g^λ`, `λ` = `--struct-shrinkage`
+   (default 0.90; 1.0 transfers the full modern dispersion, <1 guards against
+   propagating noise from small, volatile gminas over the 10–13-year horizon).
+3. **Exact benchmark with historical weights.**
+   `w_{g,t} = W_{p,t} · r_g^λ / ( Σ_{j∈p} s_{j,t} · r_j^λ )`,
+   `s_{j,t} = emp_{j,t} / Σ emp`, using year-*t* workplace employment as weights.
+   By construction the employment-weighted gmina mean reproduces P2497 **to
+   machine precision** (≈4e-16), while the within-powiat *dispersion and ranking*
+   equal the modern observed structure (Spearman rank corr 2026↔2021 = 1.0).
+
+Gminas whose modern wage is fully confidentiality-suppressed have no observed
+`r_g` and receive the powiat-neutral `r ≈ 1` (hierarchical fill); their level is
+still pinned by the powiat control.
 
 The recent-year workplace wage is taken **directly** from P4609 (trailing
 `--recent-window` months, default 12, ending at the freshest fully-populated
@@ -101,6 +117,12 @@ anchor (off by default, since P4609 is gmina-level truth). Residence wage is
 produced for the recent window only (P4609, `wg miejsca zamieszkania`); for
 2011/2021 it has no powiat anchor and is left NaN — which is all the model would
 use, since it derives `v_n` internally.
+
+**Key assumption.** The within-powiat wage *structure* (the ranking and relative
+spread of gmina means) is stable back to 2011/2021; the *level* is pinned to the
+observed powiat mean each year. λ bounds how much of the modern structure is
+carried. This is the defensible position when the fine-grained series begins only
+recently, and it is exactly the employment-weighted logic the powiat mean implies.
 
 **Suppression.** GUS encodes confidential wages (single-dominant-employer gminas
 — mining, military) as `0,00`; these are read as missing. When a gmina's recent
@@ -174,8 +196,8 @@ imputation routes are logged and flagged per gmina.
 - Crosswalk weights sum to 1 per source code; every target ∈ 2021 frame.
 - Flow gminas ⊆ 2021 frame (compatibility with the commuting matrices).
 
-`labor_build_diagnostics.json` records the transfer-model coefficients, provenance
-counts, census-control presence, and the full validation report.
+`labor_build_diagnostics.json` records the wage method and λ, provenance counts,
+census-control presence, and the full validation report.
 
 ---
 

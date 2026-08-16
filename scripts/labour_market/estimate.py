@@ -105,71 +105,62 @@ def recent_wage(wage_gmina_long, concept, end, window_months):
 # --------------------------------------------------------------------------- #
 # Within-powiat transfer model
 # --------------------------------------------------------------------------- #
-def fit_transfer_model(gmina_frame, covariates, ridge=1e-6):
-    """OLS of log wage on covariates with powiat fixed effects (within transform).
+def modern_relative_wage(recent_wage, emp_recent, hierarchy):
+    """Observed within-powiat wage structure from the modern gmina data.
 
-    gmina_frame: [code6, wage, <covariates...>]  (recent cross-section)
-    Returns beta (dict covariate->coef) and residual sd.
+    r_g = w_g^recent / (employment-weighted powiat mean of w^recent). This
+    captures the *full* within-powiat structure (the gmina-specific component,
+    not just what a few covariates explain), which is what was being lost.
+    Returns [code6, r].
     """
-    d = gmina_frame.dropna(subset=["wage"] + list(covariates)).copy()
-    d = d[d["wage"] > 0]
+    d = recent_wage.merge(emp_recent.rename(columns={"emp": "_e"}), on="code6", how="left")
     d["powiat"] = d["code6"].str[:4]
-    y = np.log(d["wage"].to_numpy(float))
-    X = d[list(covariates)].to_numpy(float)
-    # within (powiat-demean) transform
-    g = d["powiat"].to_numpy()
-    ybar = pd.Series(y).groupby(g).transform("mean").to_numpy()
-    Xdf = pd.DataFrame(X, columns=list(covariates))
-    Xbar = Xdf.groupby(g).transform("mean").to_numpy()
-    yt, Xt = y - ybar, X - Xbar
-    XtX = Xt.T @ Xt + ridge * np.eye(Xt.shape[1])
-    beta = np.linalg.solve(XtX, Xt.T @ yt)
-    resid = yt - Xt @ beta
-    dof = max(len(yt) - Xt.shape[1] - d["powiat"].nunique(), 1)
-    sd = float(np.sqrt((resid @ resid) / dof))
-    bd = dict(zip(covariates, beta))
-    LOGGER.info("transfer model: n=%d, powiats=%d, beta=%s, resid_sd=%.4f",
-                len(d), d["powiat"].nunique(), {k: round(v, 4) for k, v in bd.items()}, sd)
-    return bd, sd
+    d["_e"] = impute_hierarchical(d, "_e", hierarchy).clip(lower=1.0)
+    d["wage"] = impute_hierarchical(d, "wage", hierarchy)
+    pm = (d.assign(_n=d["wage"] * d["_e"]).groupby("powiat")
+            .agg(_n=("_n", "sum"), _E=("_e", "sum")))
+    pm = (pm["_n"] / pm["_E"]).rename("pm")
+    d = d.merge(pm, on="powiat", how="left")
+    d["r"] = d["wage"] / d["pm"]
+    LOGGER.info("modern relative wage: r in [%.2f, %.2f], within-powiat sd(log r) median=%.3f",
+                d["r"].min(), d["r"].max(),
+                d.groupby("powiat")["r"].apply(lambda x: np.log(x).std()).median())
+    return d[["code6", "r"]]
 
 
-def disaggregate_wage(year, powiat_wage, gmina_cov, beta, covariates,
-                      weight_col, shrinkage, hierarchy):
-    """Predict + exactly-benchmark gmina wage for one historical year.
+def disaggregate_wage(year, powiat_wage, relwage, emp_frame, shrinkage, hierarchy):
+    """Employment-weighted structure transfer + exact benchmark for a past year.
 
-    powiat_wage : [powiat, wage]
-    gmina_cov   : [code6, <covariates...>, weight_col]  (all 2021-frame gminas)
+        w_g,t = W_p · r_g^λ / ( Σ_{j∈p} s_j,t · r_j^λ ),   s_j,t = emp_j,t / Σ emp
+
+    so the employment-weighted gmina mean reproduces the observed powiat mean
+    (P2497) exactly, while the within-powiat *dispersion* equals the modern
+    observed structure r_g raised to λ (`shrinkage`, 1 = full transfer).
+
+    powiat_wage : [powiat, wage]      P2497 for year t (the level control)
+    relwage     : [code6, r]          modern within-powiat structure
+    emp_frame   : [code6, emp]        historical workplace employment (weights),
+                                      full 2021 frame
     Returns [code6, wage_hat, has_direct=False].
     """
-    d = gmina_cov.copy()
+    d = emp_frame.rename(columns={"emp": "_e"}).merge(relwage, on="code6", how="left")
     d["powiat"] = d["code6"].str[:4]
-    for c in covariates:
-        d[c] = impute_hierarchical(d, c, hierarchy)
-    w = d[weight_col].astype(float)
-    d["_w"] = impute_hierarchical(d.assign(**{weight_col: w}), weight_col, hierarchy).clip(lower=1.0)
-
-    # within-powiat centred covariates -> shrunk log deviation
-    dev = np.zeros(len(d))
-    for c in covariates:
-        xc = d[c].to_numpy(float)
-        xbar = pd.Series(xc).groupby(d["powiat"].to_numpy()).transform("mean").to_numpy()
-        dev += beta[c] * (xc - xbar)
-    d["_dev"] = shrinkage * dev
+    d["_e"] = impute_hierarchical(d, "_e", hierarchy).clip(lower=1.0)
+    # gminas without a modern ratio (suppressed) -> powiat/woj median ratio (~1)
+    d["r"] = impute_hierarchical(d, "r", hierarchy).clip(lower=1e-3)
+    d["rL"] = d["r"] ** float(shrinkage)
 
     d = d.merge(powiat_wage.rename(columns={"wage": "_Wp"}), on="powiat", how="left")
     if d["_Wp"].isna().any():
         d["_Wp"] = impute_hierarchical(d, "_Wp", hierarchy)
 
-    # exact within-powiat rake: employment-weighted mean of exp(dev) -> 1
-    d["_e"] = np.exp(d["_dev"])
-    num = d["_w"] * d["_e"]
+    num = d["_e"] * d["rL"]
     den = num.groupby(d["powiat"]).transform("sum")
-    wbar = (d["_w"]).groupby(d["powiat"]).transform("sum")
-    scale = wbar / den                     # so Σ s_j exp(dev_j) normalised
-    d["wage_hat"] = d["_Wp"] * d["_e"] * scale
+    esum = d["_e"].groupby(d["powiat"]).transform("sum")
+    d["wage_hat"] = d["_Wp"] * d["rL"] * esum / den      # Σ s_j w_j = W_p exactly
     d["has_direct"] = False
-    LOGGER.info("wage disaggregation %d: %d gminas, median=%.0f zł",
-                year, len(d), np.nanmedian(d["wage_hat"]))
+    LOGGER.info("wage disaggregation %d (λ=%.2f): %d gminas, median=%.0f zł",
+                year, shrinkage, len(d), np.nanmedian(d["wage_hat"]))
     return d[["code6", "wage_hat", "has_direct"]]
 
 

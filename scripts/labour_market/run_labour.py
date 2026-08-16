@@ -43,7 +43,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import config as C
-from config import LabourConfig, ModelConfig
+from config import LabourConfig
 import teryt
 import gus
 import flows
@@ -75,7 +75,8 @@ def parse_args(argv=None):
     p.add_argument("--recent-window", type=int, default=C.RECENT_WINDOW_MONTHS,
                    help="Trailing months averaged for the recent cross-section.")
     p.add_argument("--struct-shrinkage", type=float, default=LabourConfig.struct_shrinkage,
-                   help="Shrinkage (0..1) on the covariate-predicted within-powiat wage deviation.")
+                   help="Exponent λ on the modern within-powiat wage ratios "
+                        "(1.0 = full observed dispersion; <1 shrinks toward the powiat mean).")
     p.add_argument("--benchmark-recent", action="store_true",
                    help="Rake the recent gmina wage to the P2497 powiat anchor "
                         "(default off: P4609 is gmina-level truth).")
@@ -117,7 +118,6 @@ def main(argv=None):
                        benchmark_recent_to_powiat=args.benchmark_recent,
                        residence_emp_method=args.residence_emp_method,
                        ostrowice_split=args.ostrowice_split)
-    mcfg = ModelConfig()
 
     # ---- 1. crosswalk ---------------------------------------------------- #
     LOGGER.info("STAGE 1  building 2021-anchored TERYT crosswalk")
@@ -172,11 +172,11 @@ def main(argv=None):
     rec_w_work_h = build_recent_wage("workplace")
     rec_w_res_h = build_recent_wage("residence")
     recent_wsrc = dict(zip(rec_w_work_h["code6"], rec_w_work_h["wsrc"]))
-    cov_recent = covariate_frame(emp_work_year(2026), ref21)
-    # fit the transfer model only on genuinely observed gminas
-    obs = rec_w_work_h[rec_w_work_h["wsrc"].isin(["window", "own_history"])][["code6", "wage"]]
-    fit_df = cov_recent.merge(obs, on="code6", how="inner")
-    beta, resid_sd = estimate.fit_transfer_model(fit_df, mcfg.covariates, ridge=cfg.ridge)
+    # observed modern within-powiat wage structure (employment-weighted ratios);
+    # this is the structure transferred to 2011/2021, preserving true dispersion.
+    emp_recent = emp_work_year(C.RECENT_LABEL_YEAR)
+    relwage = estimate.modern_relative_wage(rec_w_work_h[["code6", "wage"]],
+                                            emp_recent, cfg.impute_hierarchy)
 
     # ---- 4. per-year build ---------------------------------------------- #
     LOGGER.info("STAGE 4  per-year assembly")
@@ -204,9 +204,9 @@ def main(argv=None):
             wage_res = rec_w_res_h[["code6", "wage"]].rename(columns={"wage": "med_res"})
         else:
             pw = wage_pow[wage_pow["year"] == y][["powiat", "wage"]]
-            gcov = cov.copy()
             wage_work = estimate.disaggregate_wage(
-                y, pw, gcov, beta, mcfg.covariates, "emp_work",
+                y, pw, relwage,
+                cov[["code6", "emp_work"]].rename(columns={"emp_work": "emp"}),
                 cfg.struct_shrinkage, cfg.impute_hierarchy)
             wage_res = pd.DataFrame({"code6": FRAME, "med_res": np.nan})
             wage_src = "P2497_disaggregated"
@@ -276,8 +276,8 @@ def main(argv=None):
     diag = {
         "target_frame_gminas": int(len(ref21)),
         "recent_window_months": win, "recent_end": list(end),
-        "transfer_beta": {k: float(v) for k, v in beta.items()},
-        "transfer_resid_sd": resid_sd,
+        "wage_method": "employment_weighted_structure_transfer",
+        "struct_shrinkage_lambda": cfg.struct_shrinkage,
         "census_control_present": {str(k): (v is not None) for k, v in census.items()},
         "validation": report,
         "config": {"struct_shrinkage": cfg.struct_shrinkage,

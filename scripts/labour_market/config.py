@@ -145,8 +145,8 @@ class LabourConfig:
     recent_end: tuple = RECENT_END
     # wage disaggregation
     benchmark_recent_to_powiat: bool = False   # recent year trusts P4609 gmina truth; no rake by default
-    struct_shrinkage: float = 0.75             # shrink covariate-predicted within-powiat deviation (0..1)
-    min_recent_obs_for_fit: int = 500          # gmina-year obs needed to fit the transfer model
+    struct_shrinkage: float = 0.90             # exponent λ on modern within-powiat wage ratios
+    #   (1.0 = transfer the full observed dispersion; <1 shrinks toward the powiat mean)
     # residence-employment recovery
     residence_emp_method: str = "flows_then_rake"  # {"flows_then_rake","workage_rake","off"}
     ostrowice_split: bool = False              # split Ostrowice across two absorbers instead of primary-only
