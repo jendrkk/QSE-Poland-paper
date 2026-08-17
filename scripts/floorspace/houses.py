@@ -62,15 +62,25 @@ def build_houses_primary(cfg: CleaningConfig, workers: int, sample_frac=None):
         "teryt", "tran_rodzaj_rynku", "dok_data",
         "nier_cena_brutto", "tran_cena_brutto", "nier_pow_gruntu",
         "usable_area_est_m2", "bdot_floors", "footprint_m2",
-        "match_overlap_frac", "tran_lokalny_id_iip", "bud_id_budynku",
+        "match_overlap_frac", "match_type", "tran_lokalny_id_iip", "bud_id_budynku",
     ]
+    # default: reliable 'overlap' matches only. With --house-use-nearest, also
+    # admit 'nearest' matches behind a footprint floor (drops the ~24 m2
+    # outbuilding artefacts) -- these are down-weighted via qweight below.
+    if cfg.house_use_nearest:
+        match_clause = (
+            f"(match_type='{BDOT_MATCH_OVERLAP}' "
+            f"OR (match_type='nearest' AND footprint_m2>={cfg.house_nearest_min_footprint}))"
+        )
+    else:
+        match_clause = f"match_type='{BDOT_MATCH_OVERLAP}'"
     where = (
         f"nier_rodzaj='{BUD_HOUSE_NIER}' AND is_residential=1 "
-        f"AND match_type='{BDOT_MATCH_OVERLAP}' AND usable_area_est_m2 IS NOT NULL "
+        f"AND {match_clause} AND usable_area_est_m2 IS NOT NULL "
         f"AND tran_rodzaj_trans='{TRANS_ARM_LENGTH}' "
         "AND (nier_udzial='1/1' OR nier_udzial IS NULL) "
         f"AND bdot_floors>={cfg.house_min_floors} AND bdot_floors<={cfg.house_max_floors} "
-        f"AND match_overlap_frac>={cfg.house_min_overlap}"
+        f"AND (match_overlap_frac>={cfg.house_min_overlap} OR match_type='nearest')"
     )
     df = rcn.read_layer(BUDYNKI_BDOT_GPKG, "budynki", cols, where, "polygon", workers)
     if sample_frac:
@@ -97,7 +107,7 @@ def build_houses_primary(cfg: CleaningConfig, workers: int, sample_frac=None):
         overlap_min=("match_overlap_frac", "min"),
     )
     h = agg.join(first[["nier_num", "tran_num", "plot_num", "market", "year",
-                        "teryt", "x2180", "y2180", "bud_id_budynku"]])
+                        "teryt", "x2180", "y2180", "bud_id_budynku", "match_type"]])
     # transaction price: property price (nier); fall back to whole-transaction price
     single = df.groupby("tran_lokalny_id_iip", sort=False).size().eq(1)
     price = h["nier_num"].where(h["nier_num"] > 0)
@@ -105,8 +115,10 @@ def build_houses_primary(cfg: CleaningConfig, workers: int, sample_frac=None):
     h["price"] = price
     h = h.reset_index().rename(columns={"teryt": "powiat_teryt", "bud_id_budynku": "unit_id"})
     h["source"] = "house_budynki"
-    # overlap-based quality weight in (0.5, 1]
+    # overlap-based quality weight in (0.5, 1]; 'nearest' matches down-weighted
     h["qweight"] = np.clip(h["overlap_min"].fillna(0.7), 0.5, 1.0)
+    if "match_type" in h:
+        h.loc[h["match_type"].astype("string") == "nearest", "qweight"] = 0.5
     h = _plot_ha_fix(h, cfg)
     LOGGER.info("HOUSES primary (budynki_bdot10k): %s transactions", f"{len(h):,}")
     return _house_frame(h)

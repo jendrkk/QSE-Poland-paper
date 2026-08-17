@@ -34,6 +34,11 @@ BUDYNKI_DZIALKI_GPKG = FLOORSPACE_DIR / "budynki_dzialki_bdot10k.gpkg"  # buildi
 DZIALKI_GPKG = FLOORSPACE_DIR / "dzialki.gpkg"
 GUS_MEDIAN_CSV = FLOORSPACE_DIR / "GUS_P3787_median_price_residential_floorspace_1m2.csv"
 GUS_MEAN_CSV = FLOORSPACE_DIR / "GUS_P3788_mean_price_residential_floorspace_1m2.csv"
+# --- gmina-level total housing stock (P2166) and powiat transaction volumes ---
+# (used by the multi-year pipeline for level reconciliation weights + validation)
+GUS_HOUSING_STOCK_CSV = FLOORSPACE_DIR / "GUS_P2166_total_housing_stock_communes_2010_2025.csv"
+GUS_COUNT_SOLD_CSV = FLOORSPACE_DIR / "GUS_P3783_count_of_sold_housing_units_in_market_transations_2010_2024.csv"
+GUS_AREA_SOLD_CSV = FLOORSPACE_DIR / "GUS_P3785_area_of_sold_housing_stock_in_market_transations_2010_2024.csv"
 
 COMMUNES_GPKG = REPO_ROOT / "data" / "processed" / "shapefiles" / "communes_2021.gpkg"
 COMMUNES_ID_COL = "JPT_KOD_JE"          # 7-digit TERYT gmina code
@@ -43,6 +48,32 @@ TERC_2021_CSV = REPO_ROOT / "data" / "raw" / "teryt" / "TERC_Urzedowy_2021-01-01
 
 OUTPUT_DIR = REPO_ROOT / "data" / "processed" / "floorspace"
 OUTPUT_STEM = "gmina_floorspace_index_2021"
+# multi-year mode writes one file per model year with this prefix + a wide combo
+MULTIYEAR_OUTPUT_PREFIX = "gmina_floorspace_index"
+MULTIYEAR_COMBINED_STEM = "gmina_floorspace_index_multiyear"
+
+# --------------------------------------------------------------------------- #
+# Multi-year (three-epoch) configuration
+# --------------------------------------------------------------------------- #
+# Model years the MRRH calibration needs a full gmina RFPI vector for, and the
+# micro window (inclusive year range) whose within-powiat spatial texture is
+# used for each. The level of every vector is re-anchored to the GUS powiat
+# price of the MODEL YEAR itself (see multiyear.py), so the window only supplies
+# the cross-sectional pattern -- a wider/late-centred window trades pattern
+# freshness for gmina coverage. Contiguous partition of 2006-2026 by default.
+MODEL_YEARS = (2011, 2021, 2026)
+EPOCH_WINDOWS = {
+    2011: (2006, 2016),
+    2021: (2017, 2022),
+    2026: (2023, 2026),
+}
+# order epochs are solved in; a later-listed epoch may borrow an earlier one's
+# spatial pattern as a shrinkage prior (2011 borrows 2021).
+EPOCH_SOLVE_ORDER = (2021, 2026, 2011)
+EPOCH_PATTERN_PRIOR = {2011: 2021}   # epoch -> epoch whose pattern seeds its prior
+# GUS price series stops in 2024; model years beyond it are extrapolated by the
+# RCN national median-price growth factor unless overridden on the CLI.
+GUS_LAST_YEAR = 2024
 
 # --------------------------------------------------------------------------- #
 # Coordinate reference systems
@@ -113,6 +144,7 @@ class CleaningConfig:
 
     # --- BDOT10k house (self-constructed usable area) quality gates ---
     house_use_nearest: bool = False   # include match_type='nearest' (noisy: outbuildings) -- off
+    house_nearest_min_footprint: float = 40.0  # min footprint m2 for a 'nearest' match (drops outbuildings)
     house_min_overlap: float = 0.30   # min match_overlap_frac for overlap matches
     house_min_floors: int = 1
     house_max_floors: int = 5         # >=6 are mismatches / not single/low-multi-family houses

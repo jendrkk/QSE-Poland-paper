@@ -98,8 +98,23 @@ def _build_controls(micro: pd.DataFrame, plot_regressor: bool = False):
 
 
 def fit_hedonic(micro: pd.DataFrame, time_fe: str = "year", ridge: float = 1e-6,
-                ref_year: int = 2021, plot_regressor: bool = False):
+                ref_year: int = 2021, plot_regressor: bool = False,
+                fixed_controls: dict | None = None, weights=None):
     """Estimate the national hedonic and return per-gmina direct estimates.
+
+    Parameters
+    ----------
+    fixed_controls : optional dict ``{"control_coef": {name: coef},
+        "control_means": {...}}``. When given, the structural characteristic
+        prices are NOT re-estimated: their contribution is partialled out of the
+        dependent variable and only the gmina + time fixed effects are fitted.
+        This lets several epochs share one common set of characteristic prices
+        (``--share-controls``) so their gmina levels are quality-adjusted to the
+        *same* reference dwelling and thin epochs borrow slope strength from the
+        pooled sample.
+    weights : optional per-row non-negative weights (e.g. ``micro['qweight']``).
+        When given the hedonic is WLS; the HC1 sandwich generalises accordingly.
+        ``None`` reproduces the unweighted OLS estimates exactly.
 
     Returns
     -------
@@ -108,6 +123,10 @@ def fit_hedonic(micro: pd.DataFrame, time_fe: str = "year", ridge: float = 1e-6,
     """
     micro = micro[micro["gmina_teryt"].notna()].copy()
     y = np.log(micro["ppm2"].to_numpy(float))
+    w = (np.ones(len(micro)) if weights is None
+         else np.clip(np.asarray(weights, dtype=float), 0.0, None))
+    if weights is not None:
+        w = np.where(np.isfinite(w), w, 0.0)
 
     # gmina design (full one-hot, absorbs the intercept)
     gcat = pd.Categorical(micro["gmina_teryt"].astype(str))
@@ -142,31 +161,54 @@ def fit_hedonic(micro: pd.DataFrame, time_fe: str = "year", ridge: float = 1e-6,
     )
 
     Zc, znames, zmean = _build_controls(micro, plot_regressor=plot_regressor)
-    Zs = sp.csr_matrix(Zc)
 
-    X = sp.hstack([G, T, Zs], format="csr")
-    nG, nT, nZ = G.shape[1], T.shape[1], Zs.shape[1]
+    use_fixed = fixed_controls is not None
+    if use_fixed:
+        # partial the fixed characteristic-price contribution out of y and fit
+        # only the gmina + time fixed effects (shared characteristic prices).
+        coef_vec = np.array([float(fixed_controls["control_coef"].get(k, 0.0))
+                             for k in znames])
+        y_fit = y - Zc @ coef_vec
+        X = sp.hstack([G, T], format="csr")
+        nG, nT, nZ = G.shape[1], T.shape[1], 0
+    else:
+        y_fit = y
+        Zs = sp.csr_matrix(Zc)
+        X = sp.hstack([G, T, Zs], format="csr")
+        nG, nT, nZ = G.shape[1], T.shape[1], Zs.shape[1]
+
     p = X.shape[1]
-    LOGGER.info("Hedonic design: n=%s, params=%d (gmina=%d, time=%d, controls=%d)",
-                f"{len(micro):,}", p, nG, nT, nZ)
+    tag = " [fixed controls]" if use_fixed else ("" if weights is None else " [WLS]")
+    LOGGER.info("Hedonic design: n=%s, params=%d (gmina=%d, time=%d, controls=%d)%s",
+                f"{len(micro):,}", p, nG, nT, nZ, tag)
 
-    XtX = (X.T @ X).toarray()
+    # (weighted) normal equations; weights=None reproduces OLS exactly (w=1)
+    sw = np.sqrt(w)
+    Xw = X.multiply(sw[:, None]).tocsr()
+    XtX = (Xw.T @ Xw).toarray()
     XtX[np.diag_indices_from(XtX)] += ridge
-    Xty = X.T @ y
+    Xty = Xw.T @ (y_fit * sw)
     XtX_inv = np.linalg.inv(XtX)
     beta = XtX_inv @ Xty
 
-    resid = y - X @ beta
-    dof = len(y) - p
-    sigma2 = float(resid @ resid / dof)
-    tss = float(((y - y.mean()) ** 2).sum())
-    r2 = 1.0 - float(resid @ resid) / tss
+    resid = y_fit - X @ beta
+    n_eff = int((w > 0).sum())
+    dof = max(n_eff - p, 1)
+    if weights is None:
+        sigma2 = float(resid @ resid / dof)
+        tss = float(((y_fit - y_fit.mean()) ** 2).sum())
+        r2 = 1.0 - float(resid @ resid) / tss if tss > 0 else float("nan")
+    else:
+        sigma2 = float((w * resid ** 2).sum() / dof)
+        ybar = np.average(y_fit, weights=w)
+        tss = float((w * (y_fit - ybar) ** 2).sum())
+        r2 = 1.0 - float((w * resid ** 2).sum()) / tss if tss > 0 else float("nan")
 
-    # HC1 sandwich for the gmina block diagonal (D_g)
-    e = resid
-    Xe = X.multiply(e[:, None]).tocsr()
-    meat = (Xe.T @ Xe).toarray()
-    scale = len(y) / dof
+    # HC1 sandwich: meat = sum_i (w_i e_i)^2 x_i x_i' (reduces to OLS HC1 at w=1)
+    a = w * resid
+    Xa = X.multiply(a[:, None]).tocsr()
+    meat = (Xa.T @ Xa).toarray()
+    scale = n_eff / dof
     cov = XtX_inv @ meat @ XtX_inv * scale
     D_g = np.clip(np.diag(cov)[:nG], 1e-9, None)
 
@@ -182,12 +224,17 @@ def fit_hedonic(micro: pd.DataFrame, time_fe: str = "year", ridge: float = 1e-6,
         }
     )
 
-    ctrl = dict(zip(znames, beta[nG + nT: nG + nT + nZ]))
+    if use_fixed:
+        ctrl = {k: float(fixed_controls["control_coef"].get(k, 0.0)) for k in znames}
+        zmean_out = fixed_controls.get("control_means", dict(zip(znames, zmean)))
+    else:
+        ctrl = dict(zip(znames, beta[nG + nT: nG + nT + nZ]))
+        zmean_out = dict(zip(znames, zmean))
     time_labels = [lab for lab in tcat.categories if lab not in ref_set]
     time_coef = dict(zip(time_labels, beta[nG: nG + nT]))
     info = {
         "control_coef": ctrl,
-        "control_means": dict(zip(znames, zmean)),
+        "control_means": zmean_out,
         "time_ref": ref,
         "time_coef": time_coef,
         "sigma2": sigma2,
@@ -328,14 +375,26 @@ def _impute(v):
     return np.where(np.isfinite(v), v, m)
 
 
-def benchmark_to_gus(index_df: pd.DataFrame, gus_anchor: pd.DataFrame, weight_col="pop"):
-    """Optional exact within-powiat rescale so the weighted mean of gmina
-    indices matches the GUS powiat 2021 value."""
+def benchmark_to_gus(index_df: pd.DataFrame, gus_anchor: pd.DataFrame = None,
+                     weight_col="pop", weights=None, gus_by_powiat=None):
+    """Exact within-powiat rescale so the weighted mean of gmina indices matches
+    the GUS powiat value.
+
+    ``gus_by_powiat`` : optional {powiat -> target zl/m2}. Overrides
+        ``gus_anchor`` (used by the multi-year pipeline to pass a per-model-year
+        anchor, incl. the 2026 extrapolation).
+    ``weights`` : optional per-row weight array aligned to ``index_df`` (e.g.
+        gmina housing stock for the model year). Overrides ``weight_col``.
+    """
     df = index_df.copy()
     df["powiat"] = df["gmina_teryt"].str[:4]
-    w = df[weight_col].to_numpy(float) if weight_col in df else np.ones(len(df))
+    if weights is not None:
+        w = np.asarray(weights, dtype=float)
+    else:
+        w = df[weight_col].to_numpy(float) if weight_col in df else np.ones(len(df))
     df["_w"] = np.where(np.isfinite(w) & (w > 0), w, 1.0)
-    g = gus_anchor.set_index("powiat")["gus_median"].to_dict()
+    g = gus_by_powiat if gus_by_powiat is not None \
+        else gus_anchor.set_index("powiat")["gus_median"].to_dict()
     factors = {}
     for pw, sub in df.groupby("powiat"):
         target = g.get(pw, np.nan)
@@ -344,9 +403,28 @@ def benchmark_to_gus(index_df: pd.DataFrame, gus_anchor: pd.DataFrame, weight_co
         wmean = np.average(sub["index_zl_m2"], weights=sub["_w"])
         if wmean > 0:
             factors[pw] = target / wmean
-    df["index_zl_m2"] = df.apply(
-        lambda r: r["index_zl_m2"] * factors.get(r["powiat"], 1.0), axis=1
-    )
+    df["index_zl_m2"] = df["index_zl_m2"].to_numpy(float) * df["powiat"].map(
+        lambda pw: factors.get(pw, 1.0)).to_numpy(float)
     df["theta_tilde"] = np.log(df["index_zl_m2"])
     LOGGER.info("Benchmarked to GUS in %d powiats", len(factors))
     return df.drop(columns=["_w"])
+
+
+def within_powiat_pattern(index_df: pd.DataFrame, weights=None,
+                          value_col="theta_tilde", out_col="prior_pattern"):
+    """Within-powiat deviation s_g = theta_g - weighted powiat mean(theta).
+
+    Used as the cross-epoch shrinkage prior: the 2011 area model receives the
+    2021 pattern here so thin 2011 gminas shrink toward their 2021 relative
+    position instead of merely the powiat mean. Returns [gmina_teryt, out_col].
+    """
+    df = index_df[["gmina_teryt", value_col]].copy()
+    df["powiat"] = df["gmina_teryt"].str[:4]
+    w = np.ones(len(df)) if weights is None else np.asarray(weights, dtype=float)
+    df["_w"] = np.where(np.isfinite(w) & (w > 0), w, 1.0)
+    v = df[value_col].to_numpy(float)
+    df["_wv"] = df["_w"] * np.where(np.isfinite(v), v, np.nan)
+    grp = df.groupby("powiat")
+    pmean = grp["_wv"].transform("sum") / grp["_w"].transform("sum")
+    df[out_col] = v - pmean.to_numpy(float)
+    return df[["gmina_teryt", out_col]]

@@ -145,6 +145,109 @@ def powiat_anchor(
     return cell.reset_index(drop=True)
 
 
+def anchor_for_year(
+    long: pd.DataFrame,
+    year: int,
+    market: str = "total",
+    size: str = "ogółem",
+    last_year: int = 2024,
+    growth: float | dict | None = None,
+) -> pd.DataFrame:
+    """Powiat price anchor for any MODEL year, extrapolating past the GUS horizon.
+
+    For ``year <= last_year`` this is exactly :func:`powiat_anchor` for that year.
+    For ``year > last_year`` (GUS stops at 2024) the ``last_year`` powiat values
+    are scaled by ``growth`` -- either a scalar national factor or a dict keyed
+    by 2-digit voivodeship code -- so the 2026 vector inherits the official 2024
+    cross-section grown by the recent RCN trend. ``growth`` compounding is the
+    caller's responsibility (pass the full last_year -> year factor).
+    """
+    if year <= last_year:
+        return powiat_anchor(long, year, market=market, size=size)
+    base = powiat_anchor(long, last_year, market=market, size=size)
+    if growth is None:
+        LOGGER.warning("anchor_for_year %d > last_year %d but no growth given; "
+                       "returning %d level unscaled", year, last_year, last_year)
+        return base
+    if isinstance(growth, dict):
+        woj = base["powiat"].str[:2]
+        g = woj.map(growth).fillna(np.nanmedian(list(growth.values()))).to_numpy(float)
+    else:
+        g = float(growth)
+    out = base.copy()
+    out["gus_median"] = out["gus_median"].to_numpy(float) * g
+    out["gus_mean"] = out["gus_mean"].to_numpy(float) * g
+    LOGGER.info("GUS anchor extrapolated %d->%d (growth=%s)",
+                last_year, year, growth if np.isscalar(growth) else "per-woj")
+    return out
+
+
+# whole-gmina TERYT type digits: 1 urban, 2 rural, 3 urban-rural (aggregate).
+# 4/5 are the miasto/obszar-wiejski split of a type-3 gmina and 8 are big-city
+# districts -- both are SUB-parts and must be excluded to avoid double counting
+# (types {1,2,3} reconstruct the national dwelling total exactly, and match the
+# 7-digit coding of communes_2021).
+_WHOLE_GMINA_TYPES = {"1", "2", "3"}
+
+
+def load_housing_stock(path: Path) -> pd.DataFrame:
+    """Gmina-level total dwelling stock (P2166) as a tidy long table.
+
+    The BDL export codes ``WWPPGGR`` (7 digits incl. the gmina TYPE digit R).
+    We keep only whole-gmina rows (type 1/2/3) so the 7-digit code joins directly
+    to ``communes_2021`` and the counts never double-count the 4/5 split parts of
+    an urban-rural gmina.
+
+    Returns columns: ``gmina_teryt`` (7-digit), ``year``, ``dwellings``. Only the
+    ``mieszkania`` (dwellings) attribute is kept; zeros/blanks -> dropped.
+    """
+    with open(path, encoding="utf-8", newline="") as fh:
+        reader = csv.reader(fh, delimiter=";")
+        header = next(reader)
+        value_cols = [(i, h) for i, h in enumerate(header)
+                      if ";" in h and "mieszkania" in h]
+        records = []
+        for row in reader:
+            if not row or not row[0]:
+                continue
+            kod = row[0].strip()
+            # keep whole gmina rows only: 7 digits, GGG != 000, PP != 00, type 1/2/3
+            if len(kod) != 7 or kod[4:] == "000" or kod[2:4] == "00":
+                continue
+            if kod[-1] not in _WHOLE_GMINA_TYPES:
+                continue
+            for i, h in value_cols:
+                if i >= len(row):
+                    continue
+                raw = row[i].strip()
+                if raw in ("", "0"):
+                    continue
+                try:
+                    val = float(raw.replace(",", "."))
+                except ValueError:
+                    continue
+                # header: "ogółem;mieszkania;YEAR;[-]"
+                _tot, _attr, year, _unit = h.split(";")
+                records.append((kod, int(year), val))
+    df = pd.DataFrame.from_records(records, columns=["gmina_teryt", "year", "dwellings"])
+    df = df.groupby(["gmina_teryt", "year"], as_index=False)["dwellings"].sum()
+    LOGGER.info("GUS housing stock: %s gmina x year rows, %d gminas, years %d-%d",
+                f"{len(df):,}", df["gmina_teryt"].nunique(),
+                int(df["year"].min()), int(df["year"].max()))
+    return df
+
+
+def housing_stock_weights(stock_long: pd.DataFrame, year: int) -> dict:
+    """{gmina_teryt (7-digit) -> dwelling count} for the given year (nearest
+    earlier year if the exact year is absent, e.g. model year 2026 -> 2025)."""
+    yrs = sorted(stock_long["year"].unique())
+    use = year if year in yrs else max([y for y in yrs if y <= year] or [min(yrs)])
+    if use != year:
+        LOGGER.info("housing-stock weights: year %d absent, using %d", year, use)
+    sub = stock_long[stock_long["year"] == use]
+    return dict(zip(sub["gmina_teryt"], sub["dwellings"].astype(float)))
+
+
 def national_series(
     long: pd.DataFrame, market: str = "total", size: str = "ogółem"
 ) -> pd.DataFrame:

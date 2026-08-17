@@ -102,6 +102,52 @@ def build_gmina_covariates(communes, land_cov, gus_anchor, terc):
 
 
 # --------------------------------------------------------------------------- #
+# Shared stages 1-3: build the pooled, gmina-assigned, land-netted micro table
+# (used by BOTH the static path and the multi-year pipeline)
+# --------------------------------------------------------------------------- #
+def build_pooled_micro(cfg, workers, sample_frac):
+    """Read + clean RCN micro, assign gminas, net house land, pool + robust-trim.
+
+    Returns (micro, communes, land_surface). ``micro`` carries rcn.MICRO_COLS +
+    ``gmina_teryt`` for ALL years in [cfg.year_min, cfg.year_max]; downstream
+    stages subset it (by year window) and estimate.
+    """
+    LOGGER.info("STAGE 1  reading + cleaning RCN micro data")
+    flats = rcn.build_flats(cfg, workers=workers, sample_frac=sample_frac)
+    houses_p = houses.build_houses_primary(cfg, workers=workers, sample_frac=sample_frac)
+    houses_m = houses.build_houses_marginal(
+        cfg, workers=workers,
+        exclude_tran_ids=houses.house_tran_ids_primary(houses_p),
+        sample_frac=sample_frac,
+    )
+    houses_raw = pd.concat([houses_p, houses_m], ignore_index=True)
+    land = rcn.build_land(cfg, workers=workers, sample_frac=sample_frac)
+
+    LOGGER.info("STAGE 2  spatial assignment to 2021 gminas")
+    communes = spatial.load_communes(C.COMMUNES_GPKG)
+    flats = spatial.assign_gmina(flats, communes, workers=workers)
+    flats = flats[flats["gmina_teryt"].notna()].copy()
+    if len(houses_raw):
+        houses_raw = spatial.assign_gmina(houses_raw, communes, workers=workers)
+    land = spatial.assign_gmina(land, communes, workers=workers)
+
+    LOGGER.info("STAGE 3  land-price surface + house land-netting")
+    land_surface = houses.build_land_surface(land, communes["gmina_teryt"], cfg)
+    houses_net = houses.net_land(houses_raw, land_surface, cfg) if len(houses_raw) else houses_raw
+
+    common = rcn.MICRO_COLS + ["gmina_teryt"]
+    micro = pd.concat(
+        [flats[common], houses_net[common]] if len(houses_net) else [flats[common]],
+        ignore_index=True,
+    )
+    micro = rcn.robust_trim(micro, cfg)
+    LOGGER.info("MICRO pooled: %s (flats=%s, houses=%s)", f"{len(micro):,}",
+                f"{(micro.source=='flat').sum():,}",
+                f"{(micro.source!='flat').sum():,}")
+    return micro, communes, land_surface
+
+
+# --------------------------------------------------------------------------- #
 # NFS-safe GeoPackage writing (mirrors commune_centroids.py)
 # --------------------------------------------------------------------------- #
 def write_gpkg_nfs_safe(gdf, output: Path, layer="floorspace_index", tmp_dir=None):
@@ -140,6 +186,38 @@ def parse_args(argv=None):
                    help="Do not recover marginal rural houses via dzialki+budynki_dzialki.")
     p.add_argument("--benchmark-to-gus", action="store_true",
                    help="Exact within-powiat rescale so weighted gmina mean = GUS.")
+    # --- multi-year (three-epoch) mode --------------------------------------- #
+    p.add_argument("--multi-year", action="store_true",
+                   help="Produce one full gmina RFPI vector PER model year "
+                        "(default 2011/2021/2026) instead of the single static index.")
+    p.add_argument("--model-years", type=str, default=None,
+                   help="Comma list of model years, e.g. '2011,2021,2026' "
+                        f"(default {','.join(map(str, C.MODEL_YEARS))}).")
+    p.add_argument("--epoch-windows", type=str, default=None,
+                   help="Per-year micro windows 'YEAR:lo-hi,...', e.g. "
+                        "'2011:2006-2016,2021:2017-2022,2026:2023-2026'. "
+                        "Only the within-powiat pattern comes from the window; "
+                        "the level is re-anchored to GUS of the model year.")
+    p.add_argument("--share-controls", action="store_true",
+                   help="Estimate one common set of characteristic prices on the "
+                        "full sample and reuse it in every epoch (recommended).")
+    p.add_argument("--benchmark-weight", choices=["stock", "txn", "pop"], default="stock",
+                   help="Weights for the within-powiat level reconciliation "
+                        "(stock=GUS gmina dwellings [default], txn=RCN counts, pop).")
+    p.add_argument("--no-benchmark", action="store_true",
+                   help="Disable the exact GUS level reconciliation in multi-year "
+                        "mode (on by default there).")
+    p.add_argument("--gus-extrapolation", type=float, default=None,
+                   help="Total multiplicative GUS-price factor from the last GUS "
+                        f"year ({C.GUS_LAST_YEAR}) to a model year beyond it "
+                        "(default: auto from RCN national median growth).")
+    p.add_argument("--wls", action="store_true",
+                   help="Weight the hedonic by qweight (down-weights marginal / "
+                        "low-overlap house obs). Off by default (unweighted OLS).")
+    p.add_argument("--house-nearest-min-footprint", type=float,
+                   default=CleaningConfig.house_nearest_min_footprint,
+                   help="With --house-use-nearest, min BDOT footprint m2 for a "
+                        "'nearest' match (excludes outbuilding artefacts).")
     p.add_argument("--bayes", action="store_true", help="Full MCMC area model (needs numpyro).")
     p.add_argument("--sample-frac", type=float, default=None,
                    help="Random fraction of transactions for a fast end-to-end test.")
@@ -173,6 +251,7 @@ def main(argv=None):
         house_land_netting=args.house_land_netting,
         house_max_floors=args.house_max_floors,
         house_use_nearest=args.house_use_nearest,
+        house_nearest_min_footprint=args.house_nearest_min_footprint,
         use_dzialki_marginal_houses=not args.no_dzialki_marginal,
     )
     mcfg = ModelConfig(
@@ -180,42 +259,13 @@ def main(argv=None):
         benchmark_to_gus=args.benchmark_to_gus, anchor=args.anchor,
     )
 
-    # ---- 1. build micro sources ----------------------------------------- #
-    LOGGER.info("STAGE 1  reading + cleaning RCN micro data")
-    flats = rcn.build_flats(cfg, workers=args.workers, sample_frac=args.sample_frac)
-    houses_p = houses.build_houses_primary(cfg, workers=args.workers, sample_frac=args.sample_frac)
-    houses_m = houses.build_houses_marginal(
-        cfg, workers=args.workers,
-        exclude_tran_ids=houses.house_tran_ids_primary(houses_p),
-        sample_frac=args.sample_frac,
-    )
-    houses_raw = pd.concat([houses_p, houses_m], ignore_index=True)
-    land = rcn.build_land(cfg, workers=args.workers, sample_frac=args.sample_frac)
+    # ---- multi-year (three-epoch) branch -------------------------------- #
+    if args.multi_year:
+        import multiyear
+        return multiyear.run(args, cfg, mcfg)
 
-    # ---- 2. spatial join to 2021 gminas --------------------------------- #
-    LOGGER.info("STAGE 2  spatial assignment to 2021 gminas")
-    communes = spatial.load_communes(C.COMMUNES_GPKG)
-    flats = spatial.assign_gmina(flats, communes, workers=args.workers)
-    flats = flats[flats["gmina_teryt"].notna()].copy()
-    if len(houses_raw):
-        houses_raw = spatial.assign_gmina(houses_raw, communes, workers=args.workers)
-    land = spatial.assign_gmina(land, communes, workers=args.workers)
-
-    # ---- 3. land-price surface + house land-netting --------------------- #
-    LOGGER.info("STAGE 3  land-price surface + house land-netting")
-    land_surface = houses.build_land_surface(land, communes["gmina_teryt"], cfg)
-    houses_net = houses.net_land(houses_raw, land_surface, cfg) if len(houses_raw) else houses_raw
-
-    # pool flats + houses into one micro table
-    common = rcn.MICRO_COLS + ["gmina_teryt"]
-    micro = pd.concat(
-        [flats[common], houses_net[common]] if len(houses_net) else [flats[common]],
-        ignore_index=True,
-    )
-    micro = rcn.robust_trim(micro, cfg)
-    LOGGER.info("MICRO pooled: %s (flats=%s, houses=%s)", f"{len(micro):,}",
-                f"{(micro.source=='flat').sum():,}",
-                f"{(micro.source!='flat').sum():,}")
+    # ---- 1-3. build the pooled, gmina-assigned, land-netted micro table -- #
+    micro, communes, land_surface = build_pooled_micro(cfg, args.workers, args.sample_frac)
 
     # ---- 4. GUS anchor + gmina covariates ------------------------------- #
     LOGGER.info("STAGE 4  GUS anchor + gmina covariates")
