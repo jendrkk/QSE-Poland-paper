@@ -50,7 +50,7 @@ years:
   2011:
     ttm: data/processed/tt_matrix/ttm_road_garmin_2011_final.npz
     wages: data/processed/labour_market/labor_tidy_2011.csv
-    floorspace: data/processed/floorspace/gmina_floorspace_index_2021.csv
+    floorspace: data/processed/floorspace/gmina_floorspace_index_2011.csv
     flows: data/raw/bilateral/bilateral_matrix_2011.xls
     flow_source_year: 2011
     ttm_tag: garmin
@@ -64,7 +64,7 @@ years:
   2026:
     ttm: data/processed/tt_matrix/ttm_road_osm_2026_final.npz
     wages: data/processed/labour_market/labor_tidy_2026.csv
-    floorspace: data/processed/floorspace/gmina_floorspace_index_2021.csv
+    floorspace: data/processed/floorspace/gmina_floorspace_index_2026.csv
     flows: null                 # not observed -> generate from margins + travel time
     borrow_params_from: 2021    # borrow the estimated phi
     ttm_tag: osm
@@ -73,7 +73,7 @@ years:
 # Solver tolerances and gates.
 # -----------------------------------------------------------------------------
 solver:
-  prod_maxiter: 5000
+  prod_maxiter: 20000
   prod_relax: 0.25
   prod_precision: 6
   prod_tol: 1.0e-8
