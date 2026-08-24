@@ -59,10 +59,43 @@ def _frame_values(gdf, codes, values):
     return out
 
 
+def _sym_jenks_bins(values, k):
+    """Symmetric Jenks (natural-breaks) class boundaries centred at zero.
+
+    Classify |value| into ~k/2 natural-breaks classes, then mirror the edges
+    across zero. Returns the UserDefined upper-edge boundaries (ascending) or
+    None if there is too little spread to classify (caller falls back to a
+    continuous scale). Outlier-robust: extremes fall into the outer classes
+    rather than stretching the whole colour range.
+    """
+    v = np.asarray(values, float)
+    absv = v[np.isfinite(v) & (v != 0)]
+    absv = np.abs(absv)
+    kk = max(2, k // 2)
+    if absv.size <= kk or np.unique(absv).size <= kk:
+        return None
+    try:
+        import mapclassify
+        edges = np.asarray(mapclassify.NaturalBreaks(absv, k=kk).bins, float)
+    except Exception:
+        edges = np.quantile(absv, np.linspace(1.0 / kk, 1.0, kk))
+    edges = np.unique(edges[edges > 0])
+    if edges.size == 0:
+        return None
+    edges[-1] = max(edges[-1], absv.max()) * 1.0001
+    return list(-edges[::-1]) + [0.0] + list(edges)
+
+
 def choropleth(gpkg_path, codes, values, title="", label="", *,
                diverging=False, k=7, cmap=None, dpi=300, transparent=True,
-               figsize=None, fmt=None, outpath=None):
-    """Render one choropleth. Returns the saved path (if outpath) or the Figure."""
+               figsize=None, fmt=None, outpath=None, diverging_continuous=False):
+    """Render one choropleth. Returns the saved path (if outpath) or the Figure.
+
+    Level maps (diverging=False) use Jenks natural breaks. Change maps
+    (diverging=True) use SYMMETRIC Jenks breaks around zero by default so a few
+    outliers cannot inflate the colour scale; pass diverging_continuous=True to
+    restore the old continuous TwoSlopeNorm.
+    """
     gdf, states = load_communes(gpkg_path)
     g = _frame_values(gdf, codes, values)
     plotted = g[g["_val"].notna()]
@@ -71,13 +104,21 @@ def choropleth(gpkg_path, codes, values, title="", label="", *,
     gdf.plot(ax=ax, color="#e6e6e6", edgecolor="none", zorder=1)
 
     if diverging:
-        vmax = float(np.nanmax(np.abs(plotted["_val"].values)))
-        vmax = vmax if vmax > 0 else 1.0
-        norm = matplotlib.colors.TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
-        plotted.plot(ax=ax, column="_val", cmap=cmap or style.CMAP_DIV, norm=norm,
-                     linewidth=0.03, edgecolor="#666666", zorder=2, legend=True,
-                     legend_kwds={"shrink": 0.55, "label": label,
-                                  "orientation": "vertical"})
+        bins = None if diverging_continuous else _sym_jenks_bins(plotted["_val"].values, k)
+        if bins is not None:
+            plotted.plot(ax=ax, column="_val", cmap=cmap or style.CMAP_DIV,
+                         scheme="UserDefined", classification_kwds={"bins": bins},
+                         linewidth=0.03, edgecolor="#666666", zorder=2, legend=True,
+                         legend_kwds={"loc": "lower left", "fontsize": 6,
+                                      "frameon": False, "title": label})
+        else:
+            vmax = float(np.nanmax(np.abs(plotted["_val"].values)))
+            vmax = vmax if vmax > 0 else 1.0
+            norm = matplotlib.colors.TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
+            plotted.plot(ax=ax, column="_val", cmap=cmap or style.CMAP_DIV, norm=norm,
+                         linewidth=0.03, edgecolor="#666666", zorder=2, legend=True,
+                         legend_kwds={"shrink": 0.55, "label": label,
+                                      "orientation": "vertical"})
     else:
         scheme = "NaturalBreaks"
         try:
