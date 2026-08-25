@@ -8,6 +8,9 @@ data/raw/
 
 # Processed data
 
+## TEMP communes with partitions
+data/processed/shapefiles/communes_2021_partitions.gpkg
+
 ## TT matrix
 data/processed/tt_matrix/
 ## Floorspace
