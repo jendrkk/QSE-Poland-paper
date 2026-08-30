@@ -21,6 +21,12 @@ data/processed/labour_market/
 # Runs
 runs/
 
+# Notes
+notes/
+
+# Cursor
+cursor_prompts/
+
 # Temp files
 _to_delete/
 

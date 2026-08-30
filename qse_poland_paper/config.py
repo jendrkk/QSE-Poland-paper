@@ -130,6 +130,7 @@ class Paths:
     repo_root: str | None = None    # resolved at runtime; default = dir containing config/
     crosswalk: str = "data/processed/labour_market/teryt_gmina_crosswalk_2021.csv"
     shapefile: str = "data/processed/shapefiles/communes_2021.gpkg"
+    partition_shapefile: str = "data/processed/shapefiles/communes_2021_partitions.gpkg"
     runs_dir: str = "runs"
 
     def resolve(self, root: Path) -> "Paths":

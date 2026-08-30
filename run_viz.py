@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 
 from qse_poland_paper.result import RunResult
-from qse_poland_paper.viz import style, maps, figures, tables
+from qse_poland_paper.viz import style, maps, figures, tables, cfmaps
 from qse_poland_paper import counterfac as cf
 
 
@@ -39,6 +39,17 @@ def _infer_gpkg(run_path: Path, override):
         if cand.exists():
             return cand
     return None
+
+
+def _infer_partition_gpkg(gpkg, override):
+    """Partition gpkg = communes_2021_partitions.gpkg, sitting next to the commune
+    gpkg. Returns None if not found (partition figures are then skipped)."""
+    if override:
+        return Path(override)
+    if gpkg is None:
+        return None
+    cand = Path(gpkg).with_name("communes_2021_partitions.gpkg")
+    return cand if cand.exists() else None
 
 
 # level maps to draw for a single run: (calibrated/inputs key, section, label, log)
@@ -126,7 +137,8 @@ def visualize_single(run: RunResult, gpkg, figdir, tabdir, *, dpi, transparent, 
     return made
 
 
-def visualize_comparison(runs, gpkg, outdir, *, dpi, transparent, fmt):
+def visualize_comparison(runs, gpkg, outdir, *, dpi, transparent, fmt,
+                         gpkg_partitions=None):
     outdir = Path(outdir)
     figdir, tabdir = outdir / "figures", outdir / "tables"
     made = []
@@ -193,6 +205,16 @@ def visualize_comparison(runs, gpkg, outdir, *, dpi, transparent, fmt):
         print(f"  road-network GE welfare change {a.year}->{b.year}: {welf_pct:+.3f}%")
     except Exception as e:
         print(f"  [network GE] skipped: {e}")
+
+    # --- full network-effect figure set (cfmaps) --------------------------- #
+    # 2 runs -> per-experiment hat maps, reallocation, own-share, job/res pull,
+    # PE access + GE-PE gap, infra-response, trade-channel diff, partition tables;
+    # 3 runs -> additionally the two cross-baseline maps. Dispatch is inside run().
+    try:
+        made += cfmaps.run(runs, gpkg, outdir, gpkg_partitions=gpkg_partitions,
+                           dpi=dpi, transparent=transparent, fmt=fmt)
+    except Exception as e:
+        print(f"  [cfmaps] skipped: {e}")
     return made
 
 
@@ -201,6 +223,8 @@ def main(argv=None):
     ap.add_argument("runs", nargs="+", help="one or more run.pkl (or run dir) paths")
     ap.add_argument("--outdir", default=None)
     ap.add_argument("--gpkg", default=None, help="commune GeoPackage (auto-inferred if omitted)")
+    ap.add_argument("--partition-gpkg", dest="partition_gpkg", default=None,
+                    help="partition GeoPackage (auto-inferred next to --gpkg if omitted)")
     ap.add_argument("--dpi", type=int, default=300)
     ap.add_argument("--format", dest="fmt", default="png", help="png|pdf|svg")
     tr = ap.add_mutually_exclusive_group()
@@ -221,6 +245,7 @@ def main(argv=None):
     gpkg = _infer_gpkg(run_paths[0], args.gpkg)
     if gpkg is None:
         print("  (no commune GeoPackage found; maps will be skipped — pass --gpkg)")
+    gpkg_partitions = _infer_partition_gpkg(gpkg, args.partition_gpkg)
 
     all_made = []
     for run, rp in zip(runs, run_paths):
@@ -236,7 +261,8 @@ def main(argv=None):
             run_paths[0].resolve().parents[1] / f"compare__{a.run_id}__{b.run_id}")
         print(f"[comparison {a.year} vs {b.year}] -> {cmp_dir}")
         all_made += visualize_comparison(runs_sorted, gpkg, cmp_dir,
-                                         dpi=args.dpi, transparent=args.transparent, fmt=args.fmt)
+                                         dpi=args.dpi, transparent=args.transparent,
+                                         fmt=args.fmt, gpkg_partitions=gpkg_partitions)
 
     print(f"\nDone. {len(all_made)} artefacts written.")
     return 0

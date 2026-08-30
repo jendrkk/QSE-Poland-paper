@@ -97,4 +97,5 @@ paths:
   repo_root: null      # resolved at runtime (default: parent of config/)
   crosswalk: data/processed/labour_market/teryt_gmina_crosswalk_2021.csv
   shapefile: data/processed/shapefiles/communes_2021.gpkg
+  partition_shapefile: data/processed/shapefiles/communes_2021_partitions.gpkg
   runs_dir: runs
