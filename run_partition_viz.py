@@ -39,6 +39,7 @@ border and gap-removal hat maps, which require observed commuting flows.)
 from __future__ import annotations
 
 import argparse
+import itertools
 from pathlib import Path
 
 import numpy as np
@@ -186,14 +187,17 @@ def main(argv=None):
         pf.gap_trajectory(gaps_all, obj="CMA", spec="woj_ttw",
                           title="Conditional market-access gap across network vintages",
                           outpath=outdir / "fig_gap_trajectory_CMA", **fkw)
-        a, b = runs[-2], runs[-1]
         piv = panel.pivot_table(index="teryt", columns="year", values="logCMA")
-        d = (piv[b.year] - piv[a.year]).reindex([str(c).zfill(7) for c in codes0]).values
-        d = d - np.nanmean(d)
-        maps.choropleth(gpkg, codes0, d, diverging=True,
-                        title=rf"Relative market-access gain, {a.year}$\to${b.year} (demeaned)",
-                        label=r"$\Delta\log$ CMA$_n$ $-$ mean", seams=seams,
-                        outpath=outdir / f"map_relaccess_{a.year}_{b.year}_seams", **sv)
+        # one relative-access map per (a, b) year pair, a < b -- not just the
+        # last two vintages, so e.g. 2011->2021 and 2011->2026 are also drawn
+        # alongside the 2021->2026 pair.
+        for a, b in itertools.combinations(runs, 2):
+            d = (piv[b.year] - piv[a.year]).reindex([str(c).zfill(7) for c in codes0]).values
+            d = d - np.nanmean(d)
+            maps.choropleth(gpkg, codes0, d, diverging=True,
+                            title=rf"Relative market-access gain, {a.year}$\to${b.year} (demeaned)",
+                            label=r"$\Delta\log$ CMA$_n$ $-$ mean", seams=seams,
+                            outpath=outdir / f"map_relaccess_{a.year}_{b.year}_seams", **sv)
         obs = [r for r in runs if r.meta.get("flows_source") == "observed"]
         rr = obs[-1] if obs else runs[-1]
         prr = parts[rr.year]
