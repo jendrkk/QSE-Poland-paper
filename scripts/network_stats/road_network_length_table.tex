@@ -1,0 +1,19 @@
+\begin{table}[htbp]
+\centering
+\caption{Length of the Polish road network by class, 2011--2026}
+\label{tab:road_network_lengths}
+\begin{tabular}{lrrrrrr}
+\hline\hline
+Road class & 2011 (km) & 2021 (km) & 2026 (km) & $\Delta$11--21 & $\Delta$21--26 & $\Delta$11--26 \\
+\hline
+A roads -- motorway (autostrada) & 2,413.5 & 3,964.6 & 12,574.9 & +64.3\% & +217.2\% & +421.0\% \\
+S roads -- trunk (droga ekspresowa) & 289.0 & 5,994.0 & 2,233.7 & +1973.9\% & -62.7\% & +672.9\% \\
+Primary -- national road (DK) & 19,402.5 & 18,513.9 & 15,749.5 & -4.6\% & -14.9\% & -18.8\% \\
+Total network (all drivable classes) & 434,553.5 & 472,028.5 & 584,246.3 & +8.6\% & +23.8\% & +34.4\% \\
+\hline\hline
+\end{tabular}
+\begin{minipage}{0.95\linewidth}
+\vspace{4pt}
+{\footnotesize Notes: A = OSM \texttt{highway=motorway} (Polish autostrada); S = OSM \texttt{highway=trunk} (Polish droga ekspresowa); Primary = OSM \texttt{highway=primary} (Polish droga krajowa, DK). Ramp/link segments (\texttt{*\_link}) are included in their parent class. Total network is the full routable graph (all drivable classes). The 2011 network is derived from a Garmin GPMapa TOPO extract; 2021 and 2026 are OpenStreetMap extracts, so the 2011$\to$2021 change conflates real infrastructure growth with a measurement/coverage change in the underlying map source. The 2021$\to$2026 change is the only like-for-like (OSM$\to$OSM) comparison. Class lengths are taken from the validated network builds in \texttt{scripts/tt\_matrix/road\_travel\_time\_matrix.py}.}
+\end{minipage}
+\end{table}

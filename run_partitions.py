@@ -107,8 +107,9 @@ def main(argv=None):
     ap.add_argument("--channels", default="commute",
                     choices=["commute", "trade", "both"])
     # removal
-    ap.add_argument("--target", default="A_n", choices=["A_n", "b_n"],
-                    help="fundamental whose partition mean is equalised")
+    ap.add_argument("--target", default="A_n", choices=["A_n", "b_n", "both"],
+                    help="fundamental whose partition mean is equalised "
+                         "('both' = A_n and b_n simultaneously in one GE solve)")
     args = ap.parse_args(argv)
 
     run_paths = [Path(r) for r in args.runs]
@@ -165,7 +166,8 @@ def main(argv=None):
                   f"welfare {b['welfare_pct']:+.3f}%  conv={b['converged']}")
 
         if "removal" in do:
-            rm = P.remove_gap(run, part, target=args.target, weight=args.weight)
+            _tgt = ("A_n", "b_n") if args.target == "both" else args.target
+            rm = P.remove_gap(run, part, target=_tgt, weight=args.weight)
             _write_scalar_tex(
                 [("Target fundamental", rm["target"]),
                  ("Welfare change (\\%)", f"{rm['welfare_pct']:.3f}"),

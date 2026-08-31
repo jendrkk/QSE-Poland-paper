@@ -118,16 +118,24 @@ def counter_facts(aChange, bChange, kapChange, dChange,
 
 
 # ---- convenience builders for the road-network experiment ------------------ #
-def build_tau_change(tau_base: np.ndarray, tau_new: np.ndarray) -> np.ndarray:
-    """kapChange_ni = tau_new / tau_base (commuting-cost hat, in *time* units;
-    tau**(-phi) is applied consistently inside the model)."""
-    return tau_new / tau_base
+def build_tau_change(tau_base: np.ndarray, tau_new: np.ndarray, mu: float) -> np.ndarray:
+    """kapChange_ni = (tau_new / tau_base) ** mu — the commuting-COST hat.
+
+    The model's commuting cost is kappa = tau**mu (quantify.commuter_market_access
+    uses tau**(-epsi*mu) = tau**(-phi)), and counter_facts' inner loop applies
+    kapChange**(-epsi). Composing the two must realise tau**(-epsi*mu) = tau**(-phi),
+    the same decay estimated from the gravity regression — hence the mu exponent
+    here. Passing the raw tau ratio (mu=1 implicitly) applies epsilon instead of
+    phi to travel time and was the bug fixed 2026-08-31 (see 01_baseline_findings.md
+    caveat (c))."""
+    return (tau_new / tau_base) ** mu
 
 
 def network_counterfactual(base_run, tau_new, dni_new=None, **overrides):
     """Run a road-network counterfactual on a solved baseline RunResult.
 
-    kapChange = tau_new / tau_base. If dni_new is given, dChange = dni_new/dni_base;
+    kapChange = (tau_new / tau_base) ** mu, mu = base_run.params['mu'] (= phi/epsi,
+    resolved at calibration time). If dni_new is given, dChange = dni_new/dni_base;
     otherwise trade costs are held fixed (commuting-only shock).
     """
     inp = base_run.inputs
@@ -135,7 +143,8 @@ def network_counterfactual(base_run, tau_new, dni_new=None, **overrides):
     n = base_run.frame["N"]
     f64 = lambda a: np.asarray(a, dtype=np.float64)   # upcast float32-stored arrays
     tau_new = f64(tau_new)
-    kapChange = build_tau_change(f64(inp["tau"]), tau_new)
+    mu = float(par["mu"])
+    kapChange = build_tau_change(f64(inp["tau"]), tau_new, mu)
     dChange = np.ones((n, n)) if dni_new is None else (f64(dni_new) / f64(inp["dni"]))
     return counter_facts(
         aChange=np.ones(n), bChange=np.ones((n, n)),

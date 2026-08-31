@@ -249,28 +249,52 @@ def impose_border(run, part, *, commute_cost=1.5, trade_cost=1.0,
 # --------------------------------------------------------------------------- #
 # (3) Gap-removal counterfactual
 # --------------------------------------------------------------------------- #
+def _equalize_hat(run, part, target, w):
+    """Per-gmina multiplicative hat that equalises the pop-weighted partition MEAN
+    (in logs) of `target` across P/R/A, holding within-partition variation fixed.
+    Returns (hat [N], partition_means {P/R/A: float})."""
+    y = np.log(np.asarray(run.calibrated[target], float))
+    overall = np.average(y, weights=w)
+    pm = {p: np.average(y[part == p], weights=w[part == p]) for p in PARTITIONS}
+    hat = np.array([np.exp(overall - pm[p]) for p in part])
+    return hat, {p: float(v) for p, v in pm.items()}
+
+
 def remove_gap(run, part, *, target="A_n", weight="R_n", **cf_kw) -> dict:
-    """Equalise the partition MEAN (pop-weighted geometric mean) of `target`
-    across P/R/A by rescaling each gmina's fundamental, holding within-partition
-    variation fixed; re-solve. target: 'A_n' (productivity, aChange) or
-    'b_n' (amenity, bChange as a row-broadcast N×N hat)."""
+    """Equalise the partition MEAN (pop-weighted geometric mean) of one or more
+    fundamentals across P/R/A by rescaling each gmina's fundamental, holding
+    within-partition variation fixed; re-solve.
+
+    `target` may be a single name or a sequence of names:
+        'A_n'            productivity gap removed (aChange)
+        'b_n'            amenity / quality-of-life gap removed (bChange, row-broadcast)
+        ('A_n', 'b_n')   BOTH gaps removed simultaneously in one GE solve
+
+    A single string reproduces the original single-fundamental experiment exactly
+    (same aChange/bChange, same solve). A sequence stacks the fundamental hats and
+    solves once, so 'both' is a genuine joint counterfactual, not two solves.
+    """
     n = run.frame["N"]
     w = _weights(run, weight)
-    if target == "A_n":
-        y = np.log(np.asarray(run.calibrated["A_n"], float))
-        overall = np.average(y, weights=w)
-        pm = {p: np.average(y[part == p], weights=w[part == p]) for p in PARTITIONS}
-        aChange = np.array([np.exp(overall - pm[p]) for p in part])
-        bChange = np.ones((n, n))
-    elif target == "b_n":
-        y = np.log(np.asarray(run.calibrated["b_n"], float))
-        overall = np.average(y, weights=w)
-        pm = {p: np.average(y[part == p], weights=w[part == p]) for p in PARTITIONS}
-        row = np.array([np.exp(overall - pm[p]) for p in part])
-        aChange = np.ones(n)
-        bChange = np.tile(row[:, None], (1, n))   # residence-amenity hat, by row
-    else:
-        raise ValueError("target must be 'A_n' or 'b_n'")
+    single = isinstance(target, str)
+    targets = (target,) if single else tuple(target)
+    bad = [t for t in targets if t not in ("A_n", "b_n")]
+    if bad:
+        raise ValueError(f"target(s) must be 'A_n' and/or 'b_n'; got {bad}")
+    if len(set(targets)) != len(targets):
+        raise ValueError(f"duplicate target(s): {targets}")
+
+    aChange = np.ones(n)
+    bChange = np.ones((n, n))
+    pm_by_target = {}
+    for t in targets:
+        hat, pm = _equalize_hat(run, part, t, w)
+        pm_by_target[t] = pm
+        if t == "A_n":
+            aChange = hat
+        else:   # b_n — residence-amenity hat, broadcast across workplace columns
+            bChange = np.tile(hat[:, None], (1, n))
+
     f64 = lambda a: np.asarray(a, float)
     res = cf.counter_facts(
         aChange=aChange, bChange=bChange, kapChange=np.ones((n, n)),
@@ -281,6 +305,6 @@ def remove_gap(run, part, *, target="A_n", weight="R_n", **cf_kw) -> dict:
         alp=run.params["alpha"], epsi=run.params["epsi"], delta=run.params["delta"],
         sigg=run.params["sigg"], nu=run.params["nu"], **cf_kw)
     res["welfare_pct"] = (res["welf"] - 1) * 100
-    res["target"] = target
-    res["partition_means"] = {p: float(v) for p, v in pm.items()}
+    res["target"] = target if single else list(targets)
+    res["partition_means"] = pm_by_target[targets[0]] if single else pm_by_target
     return res

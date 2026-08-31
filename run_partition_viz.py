@@ -16,8 +16,14 @@ Maps (per run, with partition seams overlaid + the raw partition gaps in the tit
   map_realv_<year>_seams             log real income
 Cross-year / counterfactual maps:
   map_relaccess_<a>_<b>_seams        demeaned relative access gain (clean OSM pair)
-  map_border_rhat_<year>_seams       residence reallocation under the seam
-  map_removal_lhat_<year>_seams      employment reallocation, equalise A_n means (Topic-11 (c))
+  map_border_rhat_<year>_seams       residence reallocation under the seam (manuscript)
+  map_removal_lhat_<year>_seams      employment reallocation, equalise A_n means (manuscript)
+Full six-hat GE response sets (observed-flow years only: 2011, 2021 -- NOT 2026):
+  map_border_<w|v|q|p|r|l>_hat_<year>_seams
+                                     all six border-imposition responses per year
+  map_removal_<prod|qol|both>_<w|v|q|p|r|l>_hat_<year>_seams
+                                     all six responses for each gap-removal variant
+                                     (prod=equalise A_n, qol=equalise b_n, both=jointly)
 Non-map figures:
   fig_gaps_<year>, fig_warsaw_flip_<year>, fig_cma_vs_warsaw_<year>,
   fig_box_cma_resid_<year>, fig_border_welfare, fig_gap_trajectory_CMA
@@ -25,7 +31,10 @@ Non-map figures:
 Usage
 -----
   python run_partition_viz.py runs/2011_garmin_baseline runs/2021_osm_baseline \
-      runs/2026_osm_baseline
+      runs/2026_osm_baseline --removal-targets prod qol both
+
+(2026 is accepted for the level/gap figures but automatically excluded from the
+border and gap-removal hat maps, which require observed commuting flows.)
 """
 from __future__ import annotations
 
@@ -38,6 +47,25 @@ import pandas as pd
 from qse_poland_paper.result import RunResult
 from qse_poland_paper import partitions as P
 from qse_poland_paper.viz import style, maps, partition_figs as pf
+
+
+# The six per-gmina general-equilibrium response objects returned by
+# counterfac.counter_facts (keys w, v, q, p, r, l). Each is mapped as log(hat)
+# on the diverging blue-white-red scale (blue = below zero / loss, red = gain),
+# the house convention for every "hat" object. Filename letter == dict key.
+HAT_OBJS = [
+    ("w", r"$\log\hat w_n$",      "Wage response"),
+    ("v", r"$\log\hat v_n$",      "Real-income response"),
+    ("q", r"$\log\hat q_n$",      "Floorspace-price response"),
+    ("p", r"$\log\hat p_n$",      "Goods-price response"),
+    ("r", r"$\log\hat r_n$",      "Residence reallocation"),
+    ("l", r"$\log\hat\ell_n$",   "Employment reallocation"),
+]
+
+# Gap-removal variants -> the fundamental(s) equalised across P/R/A.
+REMOVAL_TARGET = {"prod": "A_n", "qol": "b_n", "both": ("A_n", "b_n")}
+GAP_DESC = {"prod": r"$A_n$ means", "qol": r"$b_n$ means",
+            "both": r"$A_n$ \& $b_n$ means"}
 
 
 def _infer_gpkg(run_path, override):
@@ -79,6 +107,13 @@ def main(argv=None):
     ap.add_argument("--dpi", type=int, default=300)
     ap.add_argument("--format", dest="fmt", default="png")
     ap.add_argument("--no-usetex", dest="usetex", action="store_false", default=None)
+    ap.add_argument("--removal-targets", nargs="+", default=["prod", "qol", "both"],
+                    choices=["prod", "qol", "both"],
+                    help="gap-removal variants to map: prod (equalise A_n means), "
+                         "qol (equalise b_n means), both (A_n & b_n jointly)")
+    ap.add_argument("--border-commute-cost", type=float, default=1.5,
+                    help="cross-seam commuting-cost factor for the border six-hat maps "
+                         "(1.5 matches the existing map_border_rhat manuscript figure)")
     args = ap.parse_args(argv)
 
     style.use_style(usetex=args.usetex)
@@ -172,6 +207,43 @@ def main(argv=None):
                         title=rf"Employment reallocation $\log\hat\ell_n$, equalise $A_n$ means ({rr.year})",
                         label=r"$\log\hat\ell_n$", seams=seams,
                         outpath=outdir / f"map_removal_lhat_{rr.year}_seams", **sv)
+    # ---------------------------------------------------------------------- #
+    # Full six-hat GE response map sets for the border and gap-removal
+    # experiments. Both counterfactuals consume the OBSERVED commuting matrix
+    # (run.inputs["uncondCom"]) inside the GE solve, so only observed-flow years
+    # are valid; 2026 uses generated flows (own-share 0.216 vs 0.535 observed,
+    # ~21% cross-seam vs ~4%) and is excluded for BOTH experiments, exactly as
+    # the plot catalogue flags any 2026 commuting-based map as unusable.
+    # ---------------------------------------------------------------------- #
+    obs_runs = [r for r in runs if r.meta.get("flows_source") == "observed"]
+    if not obs_runs:
+        print("  [warn] no observed-flow runs; skipping border/removal hat maps")
+
+    bcost = args.border_commute_cost
+    for r in obs_runs:
+        y = r.year
+        bres = P.impose_border(r, parts[y], commute_cost=bcost, channels="commute")
+        for key, lab, phrase in HAT_OBJS:
+            maps.choropleth(
+                gpkg, r.codes, np.log(np.asarray(bres[key], float)), diverging=True,
+                title=rf"{phrase} {lab}, partition border ({y})",
+                label=lab, seams=seams,
+                outpath=outdir / f"map_border_{key}_hat_{y}_seams", **sv)
+        print(f"    border six-hat maps: {y} (commute x{bcost})")
+
+    for r in obs_runs:
+        y = r.year
+        for variant in args.removal_targets:
+            rres = P.remove_gap(r, parts[y], target=REMOVAL_TARGET[variant])
+            for key, lab, phrase in HAT_OBJS:
+                maps.choropleth(
+                    gpkg, r.codes, np.log(np.asarray(rres[key], float)), diverging=True,
+                    title=rf"{phrase} {lab}, equalise {GAP_DESC[variant]} ({y})",
+                    label=lab, seams=seams,
+                    outpath=outdir / f"map_removal_{variant}_{key}_hat_{y}_seams", **sv)
+            print(f"    removal six-hat maps: {variant} {y} "
+                  f"(welfare {rres['welfare_pct']:+.4f}%)")
+
     print("done ->", outdir)
 
 
