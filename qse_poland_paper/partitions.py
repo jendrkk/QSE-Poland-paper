@@ -171,7 +171,7 @@ _OBJECTS = {
 
 
 def _wls(y, X, w):
-    """Weighted least squares; returns (beta, robust HC0 se)."""
+    """Weighted least squares; returns (beta, robust HC0 se, full HC0 cov)."""
     W = np.sqrt(w)
     Xw, yw = X * W[:, None], y * W
     beta, *_ = np.linalg.lstsq(Xw, yw, rcond=None)
@@ -179,14 +179,17 @@ def _wls(y, X, w):
     XtWX_inv = np.linalg.pinv(Xw.T @ Xw)
     meat = (X * (w * resid**2)[:, None]).T @ X
     cov = XtWX_inv @ meat @ XtWX_inv
-    return beta, np.sqrt(np.clip(np.diag(cov), 0, None))
+    return beta, np.sqrt(np.clip(np.diag(cov), 0, None)), cov
 
 
 def partition_gaps(run, part, *, objects=None, weight="R_n",
                    controls=None, gpkg_path=None) -> dict:
     """Weighted regression of each recovered log-object on partition dummies
     (+ optional controls). Base category = Russian ('R', the largest / Warsaw
-    partition). Returns per-object means, dummy coefficients (gaps vs base) and SEs."""
+    partition). Returns per-object means, dummy coefficients vs base (P$-$R,
+    A$-$R) with SEs, and the direct Prussian$-$Austrian pairwise gap
+    (`gap_PA`) with its SE computed from the *full* HC0 covariance (i.e.
+    accounting for Cov(beta_P, beta_A), not just summing the two variances)."""
     objects = objects or list(_OBJECTS)
     w = _weights(run, weight)
     Xc, clabels = build_controls(run, controls or [], gpkg_path)
@@ -200,12 +203,15 @@ def partition_gaps(run, part, *, objects=None, weight="R_n",
         ok = np.isfinite(y) & np.all(np.isfinite(Xc), axis=1) if Xc.size else np.isfinite(y)
         X = np.column_stack([np.ones(ok.sum()), D[ok]] +
                             ([Xc[ok]] if Xc.size else []))
-        beta, se = _wls(y[ok], X, w[ok])
+        beta, se, cov = _wls(y[ok], X, w[ok])
         means = {p: float(np.average(y[part == p], weights=w[part == p]))
                  for p in PARTITIONS}
         gaps = {others[i]: (float(beta[1 + i]), float(se[1 + i])) for i in range(len(others))}
+        i_p, i_a = others.index("P") + 1, others.index("A") + 1
+        var_pa = cov[i_p, i_p] + cov[i_a, i_a] - 2 * cov[i_p, i_a]
+        gap_pa = (float(beta[i_p] - beta[i_a]), float(np.sqrt(max(var_pa, 0.0))))
         out["objects"][key] = dict(label=lab, means=means, gaps_vs_base=gaps,
-                                   n=int(ok.sum()))
+                                   gap_PA=gap_pa, n=int(ok.sum()))
     return out
 
 

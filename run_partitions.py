@@ -7,14 +7,18 @@ partition label from communes_2021_partitions.gpkg, and runs any of three
 experiments (see qse_poland_paper/partitions.py):
 
   gaps      partition means & gaps in recovered fundamentals (+ optional controls)
-  border    border-imposition counterfactual (welfare cost of re-drawing the seam)
-  removal   gap-removal counterfactual (equalise a partition mean, GE effect)
+  border    border-imposition counterfactual: sensitivity sweep over the
+            commuting-/trade-cost factor applied to cross-seam pairs
+  removal   gap-removal counterfactual: equalise a partition mean, GE effect --
+            productivity (A_n) only, amenity (b_n) only, and both jointly
 
 Outputs LaTeX tables + a JSON summary to runs/partitions__<run_id>/ (or --outdir).
+`removal_ge.tex` has one row per removal variant (default: all three); `border_ge.tex`
+has one row per (channel, cost-factor) combination swept (default factors 1.0-3.0).
 
 Examples
 --------
-  # everything, all three years, default border cost 1.5x on commuting
+  # everything, all three years, default removal variants + border sweep
   python run_partitions.py runs/2011_garmin_baseline runs/2021_osm_baseline \
       runs/2026_osm_baseline --experiment all
 
@@ -22,9 +26,13 @@ Examples
   python run_partitions.py runs/2021_osm_baseline --experiment gaps \
       --controls woj log_tt_warsaw
 
-  # border on commuting AND trade, 2x
+  # border sensitivity with a coarser sweep
   python run_partitions.py runs/2021_osm_baseline --experiment border \
-      --channels both --commute-cost 2.0 --trade-cost 1.5
+      --border-sweep 1.0 1.5 2.0
+
+  # removal table with only the productivity and joint variants
+  python run_partitions.py runs/2021_osm_baseline --experiment removal \
+      --removal-targets prod both
 """
 from __future__ import annotations
 
@@ -36,6 +44,13 @@ import numpy as np
 
 from qse_poland_paper.result import RunResult
 from qse_poland_paper import partitions as P
+
+# Gap-removal variants -> the fundamental(s) equalised across P/R/A (mirrors
+# run_partition_viz.py's REMOVAL_TARGET so the table rows and the six-hat maps
+# describe the same three counterfactuals).
+REMOVAL_TARGET = {"prod": "A_n", "qol": "b_n", "both": ("A_n", "b_n")}
+REMOVAL_LABEL = {"prod": r"$A_n$ only", "qol": r"$b_n$ only",
+                 "both": r"$A_n$ \& $b_n$ (joint)"}
 
 
 def _infer_gpkg(run_path: Path, override):
@@ -85,6 +100,45 @@ def _write_scalar_tex(rows, path, caption, label):
     Path(path).write_text("\n".join(lines) + "\n")
 
 
+def _write_removal_tex(results, path, year):
+    """`results` = list of (row_label, remove_gap()-result dict), one row per
+    removal variant (default: A_n only, b_n only, both jointly) -- all for the
+    same year, in one table."""
+    lines = [r"\begin{table}[htbp]\centering",
+             rf"\caption{{Gap-removal GE, {year} (equalise partition mean(s))}}",
+             r"\label{tab:removal_ge_%d}" % year,
+             r"\begin{tabular}{lrrrl}\hline\hline",
+             r"Target & Welfare (\%) & s.d.\ $\log\hat r_n$ & "
+             r"s.d.\ $\log\hat l_n$ & converged \\ \hline"]
+    for label, rm in results:
+        lines.append(
+            rf"{label} & {rm['welfare_pct']:+.3f} & "
+            rf"{float(np.std(np.log(rm['r']))):.4f} & "
+            rf"{float(np.std(np.log(rm['l']))):.4f} & {rm['converged']} \\")
+    lines += [r"\hline\hline\end{tabular}", r"\end{table}"]
+    Path(path).write_text("\n".join(lines) + "\n")
+
+
+def _write_border_tex(rows, path, year, sweep):
+    """`rows` = list of dicts (channel, commute_cost, trade_cost, welfare_pct,
+    sd_r, sd_l, converged), one per swept (channel, factor) combination -- the
+    border-imposition sensitivity table (replaces the old single-point table)."""
+    lines = [r"\begin{table}[htbp]\centering",
+             rf"\caption{{Border-imposition GE sensitivity, {year} (partition "
+             rf"seams; factor sweep = {', '.join(f'{s:g}' for s in sweep)})}}",
+             r"\label{tab:border_ge_%d}" % year,
+             r"\begin{tabular}{lrrrrrl}\hline\hline",
+             r"Channel & Commute$\times$ & Trade$\times$ & Welfare (\%) & "
+             r"s.d.\ $\log\hat r_n$ & s.d.\ $\log\hat l_n$ & converged \\ \hline"]
+    for r in rows:
+        lines.append(
+            rf"{r['channel']} & {r['commute_cost']:.2f} & {r['trade_cost']:.2f} & "
+            rf"{r['welfare_pct']:+.3f} & {r['sd_r']:.4f} & {r['sd_l']:.4f} & "
+            rf"{r['converged']} \\")
+    lines += [r"\hline\hline\end{tabular}", r"\end{table}"]
+    Path(path).write_text("\n".join(lines) + "\n")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="MRRH Poland partition analysis runner")
     ap.add_argument("runs", nargs="+", help="one or more run.pkl (or run dir) paths")
@@ -99,17 +153,19 @@ def main(argv=None):
                     help="woj | logpop | log_tt_warsaw")
     ap.add_argument("--objects", nargs="*", default=None,
                     help="subset of A_n b_n CMA real_v")
-    # border
-    ap.add_argument("--commute-cost", type=float, default=1.5,
-                    help="multiplicative commuting-cost factor on cross-seam pairs")
-    ap.add_argument("--trade-cost", type=float, default=1.0,
-                    help="multiplicative trade-cost factor on cross-seam pairs")
-    ap.add_argument("--channels", default="commute",
-                    choices=["commute", "trade", "both"])
+    # border -- sensitivity sweep over the cost factor, three channel rows per
+    # factor: commuting only, trade only, and both channels scaled together
+    ap.add_argument("--border-sweep", nargs="+", type=float,
+                    default=[1.0, 1.25, 1.5, 2.0, 3.0],
+                    help="cost factors to sweep for the border_ge.tex sensitivity "
+                         "table (applied to commute-only, trade-only, and "
+                         "both-channels-jointly rows)")
     # removal
-    ap.add_argument("--target", default="A_n", choices=["A_n", "b_n", "both"],
-                    help="fundamental whose partition mean is equalised "
-                         "('both' = A_n and b_n simultaneously in one GE solve)")
+    ap.add_argument("--removal-targets", nargs="+", default=["prod", "qol", "both"],
+                    choices=["prod", "qol", "both"],
+                    help="gap-removal variants to include in removal_ge.tex: prod "
+                         "(equalise A_n means), qol (equalise b_n means), both "
+                         "(A_n & b_n jointly) -- default: all three, one table per year")
     args = ap.parse_args(argv)
 
     run_paths = [Path(r) for r in args.runs]
@@ -144,42 +200,45 @@ def main(argv=None):
                       f"A-R {ga[0]:+.3f} ({ga[1]:.3f})")
 
         if "border" in do:
-            b = P.impose_border(run, part, commute_cost=args.commute_cost,
-                                trade_cost=args.trade_cost, channels=args.channels)
-            _write_scalar_tex(
-                [("Channels", b["channels"]),
-                 ("Commuting-cost factor", f"{b['commute_cost']:.2f}"),
-                 ("Trade-cost factor", f"{b['trade_cost']:.2f}"),
-                 ("Welfare change (\\%)", f"{b['welfare_pct']:.3f}"),
-                 ("s.d.\\ $\\log\\hat r_n$", f"{float(np.std(np.log(b['r']))):.4f}"),
-                 ("s.d.\\ $\\log\\hat l_n$", f"{float(np.std(np.log(b['l']))):.4f}"),
-                 ("converged", b["converged"])],
-                tabdir / "border_ge.tex",
-                f"Border-imposition GE, {run.year} (partition seams)",
-                f"tab:border_ge_{run.year}")
-            summary["border"] = {k: (float(v) if isinstance(v, (int, float, np.floating))
-                                     else v)
-                                 for k, v in b.items()
-                                 if k in ("welfare_pct", "channels", "commute_cost",
-                                          "trade_cost", "converged", "iters")}
-            print(f"    border [{b['channels']}, x{b['commute_cost']}]: "
-                  f"welfare {b['welfare_pct']:+.3f}%  conv={b['converged']}")
+            sweep = args.border_sweep
+            border_rows = []
+
+            def _run_border(channel_label, commute_cost, trade_cost, channels):
+                b = P.impose_border(run, part, commute_cost=commute_cost,
+                                    trade_cost=trade_cost, channels=channels)
+                row = dict(channel=channel_label, commute_cost=commute_cost,
+                          trade_cost=trade_cost, welfare_pct=b["welfare_pct"],
+                          sd_r=float(np.std(np.log(b["r"]))),
+                          sd_l=float(np.std(np.log(b["l"]))),
+                          converged=b["converged"])
+                border_rows.append(row)
+                print(f"    border [{channel_label:16s} x{commute_cost:.2f}/"
+                      f"{trade_cost:.2f}]: welfare {b['welfare_pct']:+.3f}%  "
+                      f"conv={b['converged']}")
+
+            for c in sweep:
+                _run_border("commute only", c, 1.0, "commute")
+            for t in sweep:
+                _run_border("trade only", 1.0, t, "trade")
+            for f in sweep:
+                _run_border("both (matched)", f, f, "both")
+
+            _write_border_tex(border_rows, tabdir / "border_ge.tex", run.year, sweep)
+            summary["border"] = {"sweep": sweep, "rows": border_rows}
 
         if "removal" in do:
-            _tgt = ("A_n", "b_n") if args.target == "both" else args.target
-            rm = P.remove_gap(run, part, target=_tgt, weight=args.weight)
-            _write_scalar_tex(
-                [("Target fundamental", rm["target"]),
-                 ("Welfare change (\\%)", f"{rm['welfare_pct']:.3f}"),
-                 ("s.d.\\ $\\log\\hat l_n$", f"{float(np.std(np.log(rm['l']))):.4f}"),
-                 ("converged", rm["converged"])],
-                tabdir / "removal_ge.tex",
-                f"Gap-removal GE, {run.year} (equalise {rm['target']} partition mean)",
-                f"tab:removal_ge_{run.year}")
-            summary["removal"] = {"target": rm["target"],
-                                  "welfare_pct": float(rm["welfare_pct"]),
-                                  "converged": bool(rm["converged"])}
-            print(f"    removal [{rm['target']}]: welfare {rm['welfare_pct']:+.3f}%")
+            removal_results = []
+            summary["removal"] = {}
+            for variant in args.removal_targets:
+                rm = P.remove_gap(run, part, target=REMOVAL_TARGET[variant],
+                                  weight=args.weight)
+                removal_results.append((REMOVAL_LABEL[variant], rm))
+                summary["removal"][variant] = {
+                    "target": rm["target"], "welfare_pct": float(rm["welfare_pct"]),
+                    "converged": bool(rm["converged"])}
+                print(f"    removal [{variant:4s} -> {rm['target']}]: "
+                      f"welfare {rm['welfare_pct']:+.3f}%  conv={rm['converged']}")
+            _write_removal_tex(removal_results, tabdir / "removal_ge.tex", run.year)
 
         (outdir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
         print(f"    wrote tables + summary.json -> {outdir}")

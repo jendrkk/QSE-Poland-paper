@@ -26,7 +26,9 @@ Full six-hat GE response sets (observed-flow years only: 2011, 2021 -- NOT 2026)
                                      (prod=equalise A_n, qol=equalise b_n, both=jointly)
 Non-map figures:
   fig_gaps_<year>, fig_warsaw_flip_<year>, fig_cma_vs_warsaw_<year>,
-  fig_box_cma_resid_<year>, fig_border_welfare, fig_gap_trajectory_CMA
+  fig_box_cma_resid_<year>, fig_border_welfare, fig_gap_trajectory_CMA,
+  fig_gap_controls_<A_n|b_n|CMA|real_v>  (2011 vs 2021, P-R & A-R, one object
+                                           per figure -- no cross-object rescaling)
 
 Usage
 -----
@@ -68,6 +70,10 @@ REMOVAL_TARGET = {"prod": "A_n", "qol": "b_n", "both": ("A_n", "b_n")}
 GAP_DESC = {"prod": r"$A_n$ means", "qol": r"$b_n$ means",
             "both": r"$A_n$ \& $b_n$ means"}
 
+# All recovered objects the partition-gap regression is run on (used both by
+# _gaps_struct and by the per-object gap-controls figures below).
+GAP_OBJS = ["A_n", "b_n", "CMA", "real_v"]
+
 
 def _infer_gpkg(run_path, override):
     if override:
@@ -81,13 +87,16 @@ def _infer_gpkg(run_path, override):
 
 
 def _gaps_struct(run, part, gpkg):
-    specs = {"raw": [], "ttw": ["log_tt_warsaw"], "woj_ttw": ["woj", "log_tt_warsaw"]}
+    specs = {"raw": [], "ttw": ["log_tt_warsaw"], "woj": ["woj"],
+             "woj_ttw": ["woj", "log_tt_warsaw"]}
     out = {}
     for s, ctrl in specs.items():
-        g = P.partition_gaps(run, part, objects=["A_n", "b_n", "CMA", "real_v"],
+        g = P.partition_gaps(run, part, objects=GAP_OBJS,
                              weight="R_n", controls=ctrl, gpkg_path=gpkg)
         out[s] = {k: {"P": list(o["gaps_vs_base"]["P"]),
-                      "A": list(o["gaps_vs_base"]["A"]), "means": o["means"]}
+                      "A": list(o["gaps_vs_base"]["A"]),
+                      "PA": list(o["gap_PA"]),   # direct Prussian-Austrian, not vs base
+                      "means": o["means"]}
                   for k, o in g["objects"].items()}
     return out
 
@@ -182,6 +191,21 @@ def main(argv=None):
                    scen_label={f"commute_{c}": rf"commute ${c}\times$" for c in args.commute_costs},
                    title="Welfare cost of re-imposing the seam (commuting channel)",
                    outpath=outdir / "fig_border_welfare", **fkw)
+
+    # Per-object gap-control evolution, contrasted across the 2011/2021 vintages
+    # (2011 vs 2021 only, as requested -- 2026 network/fundamental gaps are kept
+    # out of this comparison for consistency with the commuting-based partition
+    # results, which are restricted to observed-flow years elsewhere in this
+    # script). Four lines per figure: (2011, P-R), (2021, P-R), (2011, A-R),
+    # (2021, A-R).
+    gc_years = [r.year for r in runs if r.year in (2011, 2021)]
+    if gc_years:
+        for obj in GAP_OBJS:
+            pf.gap_controls_by_year(
+                gaps_all, obj, years=gc_years,
+                title=f"Partition gap in {pf.OBJ_LABEL[obj]} as controls are added "
+                      f"({'/'.join(str(y) for y in gc_years)})",
+                outpath=outdir / f"fig_gap_controls_{obj}", **fkw)
 
     if len(runs) >= 2:
         pf.gap_trajectory(gaps_all, obj="CMA", spec="woj_ttw",

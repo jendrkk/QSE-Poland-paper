@@ -22,7 +22,7 @@ PART_LABEL = {"P": "Prussian", "R": "Russian", "A": "Austrian"}
 PART_COLOR = {"P": "#1f5c99", "R": "#c1440e", "A": "#4a8c6f"}
 OBJ_LABEL = {"A_n": r"$\log A_n$", "b_n": r"$\log b_n$",
              "CMA": r"$\log \mathrm{CMA}_n$", "real_v": r"$\log v_n/\mathrm{CPI}$"}
-SPEC_LABEL = {"raw": "raw", "ttw": "+ dist. Warsaw",
+SPEC_LABEL = {"raw": "raw", "ttw": "+ dist. Warsaw", "woj": "+ woj. FE",
               "woj_ttw": "+ woj. FE + dist. Warsaw"}
 
 
@@ -87,6 +87,69 @@ def warsaw_flip(gaps_all, year, objects=("CMA", "real_v"),
     ax.set_title(title)
     ax.margins(x=0.08)
     _below(ax, len(objects), y=-0.22)
+    if outpath is not None:
+        return style.save(fig, outpath, dpi=dpi, transparent=transparent)
+    return fig
+
+
+# --------------------------------------------------------------------------- #
+# 2b. Gap-control evolution for one object, contrasted across years
+# --------------------------------------------------------------------------- #
+_YEAR_LS = ["-", "--", ":", "-."]
+
+# Three comparisons: the two vs-base gaps (P-R, A-R) plus the direct pairwise
+# Prussian-Austrian gap ("PA", not vs the Russian base -- see partitions.py
+# partition_gaps' gap_PA, whose SE uses the full HC0 covariance rather than
+# summing the two vs-base variances). Colour and label live here, not in
+# PART_COLOR/PART_LABEL, since "PA" isn't a partition -- it's a comparison.
+_GAP_GROUP_COLOR = {"P": PART_COLOR["P"], "A": PART_COLOR["A"], "PA": "firebrick"}
+_GAP_GROUP_LABEL = {"P": rf"{PART_LABEL['P']} $-$ {PART_LABEL['R']}",
+                    "A": rf"{PART_LABEL['A']} $-$ {PART_LABEL['R']}",
+                    "PA": rf"{PART_LABEL['P']} $-$ {PART_LABEL['A']}"}
+
+
+def gap_controls_by_year(gaps_all, obj, years, specs=("raw", "ttw", "woj", "woj_ttw"), *,
+                         groups=("P", "A", "PA"), alpha=0.75, title="", outpath=None,
+                         dpi=300, transparent=True):
+    """One recovered object, gap as controls are added -- one line per
+    (comparison, year) pair (colour = comparison, linestyle = year), all on a
+    single axis so the coefficient path is comparable across vintages. Default
+    `groups` gives 3 comparisons x len(years) lines: Prussian$-$Russian,
+    Austrian$-$Russian (vs the Russian base) and Prussian$-$Austrian (direct
+    pairwise, firebrick) -- 6 lines total for the usual 2-year call.
+
+    Unlike `warsaw_flip`, this never mixes objects on one axis (no shared-scale
+    distortion from e.g. amenity dwarfing the others) -- call it once per object
+    instead."""
+    specs = list(specs)
+    x = np.arange(len(specs))
+    fig, ax = plt.subplots(figsize=style.a4_figsize("wide"))
+    for grp in groups:
+        for yi, yr in enumerate(years):
+            yr = str(yr)
+            b = [gaps_all[yr][s][obj][grp][0] for s in specs]
+            se = [1.96 * gaps_all[yr][s][obj][grp][1] for s in specs]
+            ax.errorbar(x, b, yerr=se, fmt="o", ms=5, capsize=2.5, lw=1.3, alpha=alpha,
+                        ls=_YEAR_LS[yi % len(_YEAR_LS)], color=_GAP_GROUP_COLOR[grp],
+                        label=rf"{_GAP_GROUP_LABEL[grp]}, {yr}")
+    ax.axhline(0, color="#888888", lw=0.9, ls="--")
+    ax.set_xticks(x)
+    ax.set_xticklabels([SPEC_LABEL[s] for s in specs])
+    ax.set_ylabel(rf"gap in {OBJ_LABEL[obj]}")
+    ax.set_title(title)
+    ax.margins(x=0.08)
+    # Compact legend, one row per comparison: matplotlib's legend fill is
+    # column-major, so with handles in plot order (group-major: P-y0, P-y1,
+    # A-y0, A-y1, PA-y0, PA-y1, ...) a plain ncol=len(years) would put one year
+    # from each comparison in the same row instead of grouping by comparison.
+    # Reorder explicitly (year-major) so ncol=len(years) gives row 1 = first
+    # group (both years), row 2 = second group (both years), etc.
+    handles, labels = ax.get_legend_handles_labels()
+    order = [gi * len(years) + yi for yi in range(len(years)) for gi in range(len(groups))]
+    handles = [handles[i] for i in order]
+    labels = [labels[i] for i in order]
+    ax.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, -0.20),
+             ncol=len(years), frameon=False, handletextpad=0.5, columnspacing=1.5)
     if outpath is not None:
         return style.save(fig, outpath, dpi=dpi, transparent=transparent)
     return fig
